@@ -1,0 +1,15 @@
+Source: mutter-memfd-streamer
+Maintainer: Bardia Moshiri <bardia@furilabs.com>
+Section: misc
+Priority: optional
+Build-Depends: debhelper-compat (= 13),
+               libglib2.0-dev,
+               libdrm-dev,
+Standards-Version: 4.7.2
+Vcs-Browser: https://github.com/furilabs/mutter-memfd-streamer
+Vcs-Git: https://github.com/furilabs/mutter-memfd-streamer.git
+
+Package: mutter-memfd-streamer
+Architecture: any
+Depends: ${misc:Depends}, ${shlibs:Depends},
+Description: Memfd Mutter screencast streamer to DRM
