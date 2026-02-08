@@ -227,7 +227,7 @@ request_next_frame(StreamState *st)
                          NULL,
                          NULL,
                          G_DBUS_CALL_FLAGS_NONE,
-                         2000,
+                         -1,
                          NULL,
                          on_request_frame_done,
                          st);
@@ -253,14 +253,10 @@ request_timerfd_cb(gint fd,
 
   request_next_frame(st);
 
-  if (st->request_in_flight) {
-    guint64 now = monotonic_ns();
-    if (now != 0)
-      arm_timerfd_abs_ns(st->request_timer_fd, now + 2000000ull);
-  } else {
-    stream_rearm_request_timer(st);
-  }
+  if (st->request_in_flight)
+    return G_SOURCE_CONTINUE;
 
+  stream_rearm_request_timer(st);
   return G_SOURCE_CONTINUE;
 }
 
