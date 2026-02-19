@@ -5,10 +5,13 @@
 
 #include <gio/gio.h>
 
-#include "memfd.h"
-#include "drm.h"
-#include "stream.h"
+#include <signal.h>
+#include <stdlib.h>
+#include <string.h>
+
 #include "dbus.h"
+#include "memfd.h"
+#include "stream.h"
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -16,6 +19,7 @@ static void
 on_sig(int sig)
 {
   (void)sig;
+
   g_stop = 1;
 }
 
@@ -34,6 +38,7 @@ int
 main(int argc, char **argv)
 {
   StreamState st;
+
   memset(&st, 0, sizeof(st));
 
   st.memfd = -1;

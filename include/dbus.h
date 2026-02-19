@@ -19,7 +19,7 @@
 /**
  * Connect to the session bus and watch for IFACE_SC appearance/vanish.
  *
- * @param st  Stream state
+ * @param st Stream state
  */
 void
 setup_bus_and_watch(StreamState *st);
@@ -27,7 +27,7 @@ setup_bus_and_watch(StreamState *st);
 /**
  * Stop streaming, unsubscribe signals, unmap/close memfd, and cleanup DRM.
  *
- * @param st  Stream state
+ * @param st Stream state
  */
 void
 stream_cleanup(StreamState *st);
@@ -35,7 +35,7 @@ stream_cleanup(StreamState *st);
 /**
  * Full cleanup including name watch and bus.
  *
- * @param st  Stream state
+ * @param st Stream state
  */
 void
 cleanup_all(StreamState *st);
@@ -45,9 +45,17 @@ cleanup_all(StreamState *st);
  *
  * If vblank timing is not yet known, it falls back to REQUEST_INTERVAL_MS pacing.
  *
- * @param st  Stream state
+ * @param st Stream state
  */
 void
 stream_rearm_request_timer(StreamState *st);
+
+/**
+ * Request the next frame from the screencast service using RequestFrame.
+ *
+ * @param st Stream state
+ */
+void
+request_next_frame(StreamState *st);
 
 #endif // DBUS_H

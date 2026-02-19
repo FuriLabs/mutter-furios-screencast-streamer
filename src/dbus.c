@@ -3,97 +3,52 @@
  * Copyright (C) 2026 Bardia Moshiri <bardia@furilabs.com>
  */
 
+#include "dbus.h"
+
 #include <glib-unix.h>
 
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/timerfd.h>
 
-#include "stream.h"
-#include "dbus.h"
+#include "drm_memfd.h"
+#include "drm_native_buffer.h"
 #include "memfd.h"
-#include "drm.h"
+#include "stream.h"
+#include "utils.h"
 
-static guint64
-monotonic_ns(void)
+static gboolean
+dbus_variant_lookup_string(GVariant    *dict,
+                           const char  *key,
+                           const char **out_str)
 {
-  struct timespec ts;
-  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
-    return 0;
+  if (!dict || !key || !out_str)
+    return FALSE;
 
-  return (guint64)ts.tv_sec * 1000000000ull + (guint64)ts.tv_nsec;
+  GVariant *v = g_variant_lookup_value(dict, key, G_VARIANT_TYPE_STRING);
+  if (!v)
+    return FALSE;
+
+  *out_str = g_variant_get_string(v, NULL);
+  g_variant_unref(v);
+  return TRUE;
 }
 
-static guint64
-clamp_u64(guint64 v,
-          guint64 lo,
-          guint64 hi)
+static gboolean
+dbus_variant_lookup_u32(GVariant   *dict,
+                        const char *key,
+                        guint32    *out_u32)
 {
-  if (v < lo)
-    return lo;
-  if (v > hi)
-    return hi;
-  return v;
-}
+  if (!dict || !key || !out_u32)
+    return FALSE;
 
-static void
-arm_timerfd_abs_ns(int fd,
-                   guint64 when_ns)
-{
-  struct itimerspec its;
-  memset(&its, 0, sizeof(its));
+  GVariant *v = g_variant_lookup_value(dict, key, G_VARIANT_TYPE_UINT32);
+  if (!v)
+    return FALSE;
 
-  its.it_value.tv_sec = (time_t)(when_ns / 1000000000ull);
-  its.it_value.tv_nsec = (long)(when_ns % 1000000000ull);
-
-  if (timerfd_settime(fd, TFD_TIMER_ABSTIME, &its, NULL) != 0)
-    g_warning("timerfd_settime failed: %s", g_strerror(errno));
-}
-
-void
-stream_rearm_request_timer(StreamState *st)
-{
-  if (!st)
-    return;
-
-  if (st->request_timer_fd < 0)
-    return;
-
-  guint64 now = monotonic_ns();
-  if (now == 0)
-    return;
-
-  guint64 period = st->vblank_period_ns;
-  if (period == 0)
-    period = 16666666ull;
-
-  guint64 lead = st->vblank_lead_ns;
-  lead = clamp_u64(lead, 0, period / 2);
-
-  guint64 target = 0;
-
-  if (st->vblank_valid && st->vblank_last_ns != 0) {
-    guint64 last = st->vblank_last_ns;
-
-    guint64 n = 1;
-    if (now > last) {
-      guint64 delta = now - last;
-      n = (delta / period) + 1;
-    }
-
-    guint64 next_vblank = last + n * period;
-    if (next_vblank > lead)
-      target = next_vblank - lead;
-    else
-      target = now;
-  } else {
-    target = now + (guint64)REQUEST_INTERVAL_MS * 1000000ull;
-  }
-
-  if (target < now + 200000ull)
-    target = now + 200000ull;
-
-  arm_timerfd_abs_ns(st->request_timer_fd, target);
+  *out_u32 = g_variant_get_uint32(v);
+  g_variant_unref(v);
+  return TRUE;
 }
 
 static GVariant *
@@ -127,14 +82,96 @@ call_sync(GDBusConnection *bus,
   return ret;
 }
 
+static gboolean
+get_info_dbus(GDBusConnection  *bus,
+              const char       *stream_path,
+              StreamState      *st,
+              GVariant        **out_info)
+{
+  if (!bus || !stream_path || !st || !out_info)
+    return FALSE;
+
+  g_print("[GetInfo] calling GetInfo on %s\n", stream_path);
+
+  g_autoptr(GVariant) ret = call_sync(bus,
+                                     IFACE_SC,
+                                     stream_path,
+                                     IFACE_STREAM,
+                                     "GetInfo",
+                                     NULL);
+  if (!ret)
+    return FALSE;
+
+  GVariant *dict = NULL;
+
+  g_variant_get(ret, "(@a{sv})", &dict);
+  if (!dict)
+    return FALSE;
+
+  *out_info = g_variant_ref(dict);
+  g_variant_unref(dict);
+
+  g_print("[GetInfo] got info dict for %s\n", stream_path);
+
+  return TRUE;
+}
+
+static StreamBackendType
+backend_from_info(GVariant    *info,
+                  StreamState *st)
+{
+  st->backend = STREAM_BACKEND_UNKNOWN;
+  st->info_width = 0;
+  st->info_height = 0;
+  st->info_fps = 0.0;
+
+  const char *type_str = NULL;
+
+  if (info) {
+    if (dbus_variant_lookup_string(info, "type", &type_str) && type_str) {
+      if (strcmp(type_str, "memfd") == 0)
+        st->backend = STREAM_BACKEND_MEMFD;
+      else if (strcmp(type_str, "native-buffer") == 0)
+        st->backend = STREAM_BACKEND_NATIVE_BUFFER;
+    }
+
+    dbus_variant_lookup_u32(info, "width", &st->info_width);
+    dbus_variant_lookup_u32(info, "height", &st->info_height);
+
+    GVariant *v_fps_d = g_variant_lookup_value(info, "fps", G_VARIANT_TYPE_DOUBLE);
+    if (v_fps_d) {
+      st->info_fps = g_variant_get_double(v_fps_d);
+      g_variant_unref(v_fps_d);
+    } else {
+      GVariant *v_fps_u = g_variant_lookup_value(info, "fps", G_VARIANT_TYPE_UINT32);
+      if (v_fps_u) {
+        st->info_fps = (double)g_variant_get_uint32(v_fps_u);
+        g_variant_unref(v_fps_u);
+      }
+    }
+  }
+
+  const char *backend_str = (st->backend == STREAM_BACKEND_MEMFD) ? "memfd" :
+                            (st->backend == STREAM_BACKEND_NATIVE_BUFFER) ? "native-buffer" :
+                            "unknown";
+
+  g_print("[GetInfo] backend=%s width=%u height=%u fps=%f\n",
+          backend_str,
+          st->info_width,
+          st->info_height,
+          st->info_fps);
+
+  return st->backend;
+}
+
 static int
 get_memfd_dbus(GDBusConnection *bus,
-                   const char *stream_path)
+               const char      *stream_path)
 {
   g_autoptr(GError) err = NULL;
   g_autoptr(GUnixFDList) out_fds = NULL;
 
-  g_debug("[GetMemfd] calling GetMemfd on %s", stream_path);
+  g_print("[GetMemfd] calling GetMemfd on %s\n", stream_path);
 
   g_autoptr(GVariant) ret = g_dbus_connection_call_with_unix_fd_list_sync(bus,
                                                                           IFACE_SC,
@@ -155,6 +192,7 @@ get_memfd_dbus(GDBusConnection *bus,
   }
 
   gint handle_index = -1;
+
   g_variant_get(ret, "(h)", &handle_index);
 
   if (!out_fds || handle_index < 0) {
@@ -170,107 +208,151 @@ get_memfd_dbus(GDBusConnection *bus,
   }
 
   struct stat stbuf;
+
   if (fstat(fd, &stbuf) != 0) {
     g_warning("[GetMemfd] fstat failed: %s", g_strerror(errno));
     close(fd);
     return -1;
   }
 
-  g_debug("[GetMemfd] got fd=%d size=%zu", fd, (size_t)stbuf.st_size);
+  g_print("[GetMemfd] got fd=%d size=%zu\n", fd, (size_t)stbuf.st_size);
+
   return fd;
 }
 
-static void
-on_request_frame_done(GObject *source_object,
-                      GAsyncResult *res,
-                      gpointer user_data)
+static gboolean
+setup_memfd_backend(StreamState *st)
 {
-  (void)source_object;
+  if (!st || !st->bus || !st->stream_path)
+    return FALSE;
 
-  StreamState *st = user_data;
-  if (!st)
-    return;
+  st->memfd = get_memfd_dbus(st->bus, st->stream_path);
+  if (st->memfd < 0)
+    return FALSE;
 
-  st->request_in_flight = FALSE;
+  struct stat stbuf;
+
+  if (fstat(st->memfd, &stbuf) != 0) {
+    g_warning("fstat(memfd) failed: %s", g_strerror(errno));
+    return FALSE;
+  }
+
+  st->map_len = (size_t)stbuf.st_size;
+  st->map_base = mmap(NULL,
+                      st->map_len,
+                      PROT_READ,
+                      MAP_SHARED,
+                      st->memfd,
+                      0);
+  if (st->map_base == MAP_FAILED) {
+    g_warning("mmap(memfd) failed: %s", g_strerror(errno));
+    return FALSE;
+  }
+
+  st->hdr = (MetaFuriosMemfdHeader *)st->map_base;
+
+  if (!memfd_header_sane(st->hdr)) {
+    g_warning("invalid memfd header");
+    return FALSE;
+  }
+
+  st->last_seen_seq = st->hdr->seq;
+  st->last_presented_seq = st->hdr->seq;
+  st->inflight_flip_seq = 0;
+  st->force_full_damage = TRUE;
+
+  st->pending_seq = st->last_seen_seq;
+  st->pending_slot = st->hdr->last_slot;
+
+  return TRUE;
+}
+
+static gboolean
+setup_native_buffer_backend(StreamState *st)
+{
+  if (!st || !st->bus || !st->stream_path)
+    return FALSE;
 
   g_autoptr(GError) err = NULL;
-  GVariant *ret = g_dbus_connection_call_finish(st->bus, res, &err);
+  g_autoptr(GUnixFDList) out_fds = NULL;
+
+  g_print("[GetNativeBufferHandle] calling on %s\n", st->stream_path);
+
+  g_autoptr(GVariant) ret = g_dbus_connection_call_with_unix_fd_list_sync(st->bus,
+                                                                          IFACE_SC,
+                                                                          st->stream_path,
+                                                                          IFACE_STREAM,
+                                                                          "GetNativeBufferHandle",
+                                                                          NULL,
+                                                                          NULL,
+                                                                          G_DBUS_CALL_FLAGS_NONE,
+                                                                          5000,
+                                                                          NULL,
+                                                                          &out_fds,
+                                                                          NULL,
+                                                                          &err);
   if (!ret) {
-    g_warning("RequestFrame async error: %s",
-              err ? err->message : "unknown error");
-    return;
+    g_warning("GetNativeBufferHandle failed: %s", err ? err->message : "unknown error");
+    return FALSE;
   }
 
-  g_variant_unref(ret);
+  g_print("[GetNativeBufferHandle] ok\n");
 
-  if (st->request_timer_fd >= 0)
-    stream_rearm_request_timer(st);
-}
+  GVariant *dict = NULL;
 
-static void
-request_next_frame(StreamState *st)
-{
-  if (!st || !st->bus || !st->stream_path)
-    return;
-  if (!st->streaming)
-    return;
-  if (st->request_in_flight)
-    return;
-
-  st->request_in_flight = TRUE;
-
-  g_dbus_connection_call(st->bus,
-                         IFACE_SC,
-                         st->stream_path,
-                         IFACE_STREAM,
-                         "RequestFrame",
-                         NULL,
-                         NULL,
-                         G_DBUS_CALL_FLAGS_NONE,
-                         -1,
-                         NULL,
-                         on_request_frame_done,
-                         st);
-}
-
-static gboolean
-request_timerfd_cb(gint fd,
-                   GIOCondition cond,
-                   gpointer user_data)
-{
-  (void)cond;
-
-  StreamState *st = user_data;
-  if (!st)
-    return G_SOURCE_CONTINUE;
-
-  uint64_t expirations = 0;
-  ssize_t n = read(fd, &expirations, sizeof(expirations));
-  if (n < 0) {
-    if (errno != EAGAIN)
-      g_warning("timerfd read failed: %s", g_strerror(errno));
+  g_variant_get(ret, "(@a{sv})", &dict);
+  if (!dict) {
+    g_warning("GetNativeBufferHandle returned no dict");
+    return FALSE;
   }
 
-  request_next_frame(st);
+  if (st->native_info)
+    g_variant_unref(st->native_info);
 
-  if (st->request_in_flight)
-    return G_SOURCE_CONTINUE;
+  st->native_info = g_variant_ref(dict);
+  g_variant_unref(dict);
 
-  stream_rearm_request_timer(st);
-  return G_SOURCE_CONTINUE;
-}
+  int n = out_fds ? g_unix_fd_list_get_length(out_fds) : 0;
 
-static gboolean
-request_frame_tick(gpointer data)
-{
-  StreamState *st = data;
-  if (!st || !st->bus || !st->stream_path)
-    return G_SOURCE_CONTINUE;
-  if (!st->streaming)
-    return G_SOURCE_CONTINUE;
+  st->native_n_fds = 0;
+  g_clear_pointer(&st->native_fds, g_free);
 
-  request_next_frame(st);
-  return G_SOURCE_CONTINUE;
+  if (n > 0) {
+    st->native_fds = g_new0(int, n);
+
+    for (int i = 0; i < n; i++) {
+      int fd = g_unix_fd_list_get(out_fds, i, &err);
+      if (fd < 0) {
+        g_warning("g_unix_fd_list_get(%d) failed: %s", i, err ? err->message : "unknown");
+        st->native_fds[i] = -1;
+        g_clear_error(&err);
+        continue;
+      }
+
+      st->native_fds[i] = fd;
+    }
+
+    st->native_n_fds = n;
+  }
+
+  st->native_slots = NULL;
+  st->native_n_slots = 0;
+  st->native_stride_pixels = 0;
+  st->native_width = 0;
+  st->native_height = 0;
+  st->native_modeset_done = FALSE;
+  st->native_current_slot = 0;
+  st->native_current_fb_id = 0;
+
+  st->last_seen_seq = 0;
+  st->last_presented_seq = 0;
+  st->inflight_flip_seq = 0;
+  st->force_full_damage = TRUE;
+
+  st->pending_seq = 0;
+  st->pending_slot = 0;
+
+  return TRUE;
 }
 
 static void
@@ -284,21 +366,35 @@ pending_damage_set_full(StreamState *st)
   else
     g_array_set_size(st->pending_damage, 0);
 
-  if (!st->hdr)
-    return;
+  guint32 w = 0;
+  guint32 h = 0;
+
+  if (st->backend == STREAM_BACKEND_MEMFD && st->hdr) {
+    w = st->hdr->width;
+    h = st->hdr->height;
+  } else {
+    w = st->info_width;
+    h = st->info_height;
+  }
+
+  if (w == 0)
+    w = 1920;
+  if (h == 0)
+    h = 1080;
 
   DamageRect r;
+
   r.x = 0;
   r.y = 0;
-  r.w = (int32_t)st->hdr->width;
-  r.h = (int32_t)st->hdr->height;
+  r.w = (int32_t)w;
+  r.h = (int32_t)h;
 
   g_array_append_val(st->pending_damage, r);
 }
 
 static void
 pending_damage_replace(StreamState *st,
-                        GVariant *damage)
+                       GVariant    *damage)
 {
   if (!st)
     return;
@@ -320,8 +416,10 @@ pending_damage_replace(StreamState *st,
   gint32 h = 0;
 
   g_variant_iter_init(&iter, damage);
+
   while (g_variant_iter_next(&iter, "(iiii)", &x, &y, &w, &h)) {
     DamageRect r;
+
     r.x = x;
     r.y = y;
     r.w = w;
@@ -345,19 +443,22 @@ render_or_defer(StreamState *st)
     return;
   }
 
-  render_frame_drm(st);
+  if (st->backend == STREAM_BACKEND_NATIVE_BUFFER)
+    render_frame_drm_native_buffer(st);
+  else
+    render_frame_drm_memfd(st);
 }
 
 static void
 on_frame_ready_common(StreamState *st,
-                      guint32 seq,
-                      guint32 slot,
-                      GVariant *damage_maybe)
+                      guint32      seq,
+                      guint32      slot,
+                      GVariant    *damage_maybe)
 {
-  if (!st || !st->hdr)
+  if (!st)
     return;
 
-  if (seq == st->last_seen_seq)
+  if (seq <= st->last_seen_seq)
     return;
 
   if (st->sink.pending_flip)
@@ -387,17 +488,18 @@ on_frame_ready_common(StreamState *st,
 
 static void
 on_frame_ready(GDBusConnection *connection,
-               const gchar *sender_name,
-               const gchar *object_path,
-               const gchar *interface_name,
-               const gchar *signal_name,
-               GVariant *parameters,
-               gpointer user_data)
+               const gchar     *sender_name,
+               const gchar     *object_path,
+               const gchar     *interface_name,
+               const gchar     *signal_name,
+               GVariant        *parameters,
+               gpointer         user_data)
 {
   (void)connection;
   (void)sender_name;
   (void)object_path;
   (void)interface_name;
+  (void)signal_name;
 
   StreamState *st = user_data;
   guint32 seq = 0;
@@ -413,17 +515,18 @@ on_frame_ready(GDBusConnection *connection,
 
 static void
 on_frame_ready_with_damage(GDBusConnection *connection,
-                           const gchar *sender_name,
-                           const gchar *object_path,
-                           const gchar *interface_name,
-                           const gchar *signal_name,
-                           GVariant *parameters,
-                           gpointer user_data)
+                           const gchar     *sender_name,
+                           const gchar     *object_path,
+                           const gchar     *interface_name,
+                           const gchar     *signal_name,
+                           GVariant        *parameters,
+                           gpointer         user_data)
 {
   (void)connection;
   (void)sender_name;
   (void)object_path;
   (void)interface_name;
+  (void)signal_name;
 
   StreamState *st = user_data;
   guint32 seq = 0;
@@ -441,6 +544,163 @@ on_frame_ready_with_damage(GDBusConnection *connection,
     g_variant_unref(damage);
 }
 
+void
+stream_rearm_request_timer(StreamState *st)
+{
+  if (!st)
+    return;
+
+  if (st->backend == STREAM_BACKEND_NATIVE_BUFFER)
+    return;
+
+  if (st->request_timer_fd < 0)
+    return;
+
+  guint64 now = monotonic_ns();
+  if (now == 0)
+    return;
+
+  guint64 period = st->vblank_period_ns;
+  if (period == 0)
+    period = 16666666ull;
+
+  guint64 lead = st->vblank_lead_ns;
+
+  lead = clamp_u64(lead, 0, period / 2);
+
+  guint64 target = 0;
+
+  if (st->vblank_valid && st->vblank_last_ns != 0) {
+    guint64 last = st->vblank_last_ns;
+    guint64 n = 1;
+
+    if (now > last) {
+      guint64 delta = now - last;
+      n = (delta / period) + 1;
+    }
+
+    guint64 next_vblank = last + n * period;
+
+    if (next_vblank > lead)
+      target = next_vblank - lead;
+    else
+      target = now;
+  } else {
+    target = now + (guint64)REQUEST_INTERVAL_MS * 1000000ull;
+  }
+
+  if (target < now + 200000ull)
+    target = now + 200000ull;
+
+  arm_timerfd_abs_ns(st->request_timer_fd, target);
+}
+
+static void
+on_request_frame_done(GObject      *source_object,
+                      GAsyncResult *res,
+                      gpointer      user_data)
+{
+  (void)source_object;
+
+  StreamState *st = user_data;
+  if (!st)
+    return;
+
+  st->request_in_flight = FALSE;
+
+  g_autoptr(GError) err = NULL;
+  GVariant *ret = g_dbus_connection_call_finish(st->bus, res, &err);
+
+  if (!ret) {
+    g_warning("RequestFrame async error: %s",
+              err ? err->message : "unknown error");
+    return;
+  }
+
+  g_debug("[RequestFrame] done ok");
+
+  g_variant_unref(ret);
+
+  if (st->request_timer_fd >= 0 && st->backend != STREAM_BACKEND_NATIVE_BUFFER)
+    stream_rearm_request_timer(st);
+}
+
+void
+request_next_frame(StreamState *st)
+{
+  if (!st || !st->bus || !st->stream_path)
+    return;
+  if (!st->streaming)
+    return;
+  if (st->request_in_flight)
+    return;
+
+  st->request_in_flight = TRUE;
+
+  g_debug("[RequestFrame] calling on %s", st->stream_path);
+
+  g_dbus_connection_call(st->bus,
+                         IFACE_SC,
+                         st->stream_path,
+                         IFACE_STREAM,
+                         "RequestFrame",
+                         NULL,
+                         NULL,
+                         G_DBUS_CALL_FLAGS_NONE,
+                         -1,
+                         NULL,
+                         on_request_frame_done,
+                         st);
+}
+
+static gboolean
+request_timerfd_cb(gint         fd,
+                   GIOCondition cond,
+                   gpointer     user_data)
+{
+  (void)cond;
+
+  StreamState *st = user_data;
+  if (!st)
+    return G_SOURCE_CONTINUE;
+
+  if (st->backend == STREAM_BACKEND_NATIVE_BUFFER)
+    return G_SOURCE_CONTINUE;
+
+  uint64_t expirations = 0;
+  ssize_t n = read(fd, &expirations, sizeof(expirations));
+
+  if (n < 0) {
+    if (errno != EAGAIN)
+      g_warning("timerfd read failed: %s", g_strerror(errno));
+  }
+
+  request_next_frame(st);
+
+  if (st->request_in_flight)
+    return G_SOURCE_CONTINUE;
+
+  stream_rearm_request_timer(st);
+  return G_SOURCE_CONTINUE;
+}
+
+static gboolean
+request_frame_tick(gpointer data)
+{
+  StreamState *st = data;
+
+  if (!st || !st->bus || !st->stream_path)
+    return G_SOURCE_CONTINUE;
+  if (!st->streaming)
+    return G_SOURCE_CONTINUE;
+
+  if (st->backend == STREAM_BACKEND_NATIVE_BUFFER)
+    return G_SOURCE_CONTINUE;
+
+  request_next_frame(st);
+  return G_SOURCE_CONTINUE;
+}
+
 static void
 start_streaming(StreamState *st)
 {
@@ -450,8 +710,14 @@ start_streaming(StreamState *st)
   st->streaming = TRUE;
   st->request_in_flight = FALSE;
 
+  if (st->backend == STREAM_BACKEND_NATIVE_BUFFER) {
+    request_next_frame(st);
+    return;
+  }
+
   if (st->request_timer_fd < 0) {
     st->request_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+
     if (st->request_timer_fd >= 0) {
       if (!st->request_timer_source_id)
         st->request_timer_source_id = g_unix_fd_add_full(G_PRIORITY_HIGH,
@@ -462,6 +728,7 @@ start_streaming(StreamState *st)
                                                          NULL);
 
       guint64 now = monotonic_ns();
+
       if (now != 0)
         arm_timerfd_abs_ns(st->request_timer_fd, now + 1000000ull);
     } else {
@@ -478,6 +745,32 @@ start_streaming(StreamState *st)
 }
 
 static void
+cb_vblank_rearm(StreamState *st)
+{
+  if (!st)
+    return;
+
+  if (st->backend != STREAM_BACKEND_NATIVE_BUFFER)
+    stream_rearm_request_timer(st);
+}
+
+static void
+cb_flip_complete_native_request(StreamState *st)
+{
+  if (!st)
+    return;
+
+  if (st->backend == STREAM_BACKEND_NATIVE_BUFFER && st->streaming)
+    request_next_frame(st);
+}
+
+static void
+cb_render_pending(StreamState *st)
+{
+  render_or_defer(st);
+}
+
+static void
 connect_and_prepare_stream(StreamState *st)
 {
   if (!st || !st->bus)
@@ -485,11 +778,11 @@ connect_and_prepare_stream(StreamState *st)
 
   stream_cleanup(st);
 
-  g_print("[setup] CreateSession()\n");
-
   GVariantBuilder b;
+
   g_variant_builder_init(&b, G_VARIANT_TYPE("a{sv}"));
-  GVariant *props = g_variant_builder_end(&b);
+
+  GVariant *props = g_variant_ref_sink(g_variant_builder_end(&b));
 
   g_autoptr(GVariant) ret_create_session = call_sync(st->bus,
                                                      IFACE_SC,
@@ -497,18 +790,21 @@ connect_and_prepare_stream(StreamState *st)
                                                      IFACE_SC,
                                                      "CreateSession",
                                                      g_variant_new("(@a{sv})", props));
+  g_variant_unref(props);
+
   if (!ret_create_session)
     return;
 
   const char *session_path_tmp = NULL;
+
   g_variant_get(ret_create_session, "(&o)", &session_path_tmp);
   st->session_path = g_strdup(session_path_tmp);
 
-  g_print("Session: %s\n", st->session_path);
-  g_print("[setup] CreateStream()\n");
+  g_print("[DBus] CreateSession -> %s\n", st->session_path);
 
   g_variant_builder_init(&b, G_VARIANT_TYPE("a{sv}"));
-  GVariant *sprops = g_variant_builder_end(&b);
+
+  GVariant *sprops = g_variant_ref_sink(g_variant_builder_end(&b));
 
   g_autoptr(GVariant) ret_create_stream = call_sync(st->bus,
                                                     IFACE_SC,
@@ -516,70 +812,58 @@ connect_and_prepare_stream(StreamState *st)
                                                     IFACE_SESSION,
                                                     "CreateStream",
                                                     g_variant_new("(@a{sv})", sprops));
+  g_variant_unref(sprops);
+
   if (!ret_create_stream)
     return;
 
   const char *stream_path_tmp = NULL;
+
   g_variant_get(ret_create_stream, "(&o)", &stream_path_tmp);
   st->stream_path = g_strdup(stream_path_tmp);
 
-  g_print("Stream: %s\n", st->stream_path);
-  g_print("[setup] Start()\n");
+  g_print("[DBus] CreateStream -> %s\n", st->stream_path);
 
   g_autoptr(GVariant) ret_start = call_sync(st->bus,
-                                           IFACE_SC,
-                                           st->session_path,
-                                           IFACE_SESSION,
-                                           "Start",
-                                           NULL);
+                                            IFACE_SC,
+                                            st->session_path,
+                                            IFACE_SESSION,
+                                            "Start",
+                                            NULL);
   if (!ret_start)
     return;
 
-  st->memfd = get_memfd_dbus(st->bus, st->stream_path);
-  if (st->memfd < 0)
-    return;
+  g_print("[DBus] Start ok (session=%s)\n", st->session_path);
 
-  struct stat stbuf;
-  if (fstat(st->memfd, &stbuf) != 0) {
-    g_warning("fstat(memfd) failed: %s", g_strerror(errno));
-    stream_cleanup(st);
-    return;
+  g_autoptr(GVariant) info = NULL;
+
+  if (get_info_dbus(st->bus, st->stream_path, st, &info))
+    backend_from_info(info, st);
+  else
+    st->backend = STREAM_BACKEND_MEMFD;
+
+  if (st->backend == STREAM_BACKEND_NATIVE_BUFFER) {
+    if (!setup_native_buffer_backend(st)) {
+      stream_cleanup(st);
+      return;
+    }
+  } else {
+    st->backend = STREAM_BACKEND_MEMFD;
+
+    if (!setup_memfd_backend(st)) {
+      stream_cleanup(st);
+      return;
+    }
+
+    st->info_width = st->hdr ? st->hdr->width : st->info_width;
+    st->info_height = st->hdr ? st->hdr->height : st->info_height;
   }
-
-  st->map_len = (size_t)stbuf.st_size;
-  st->map_base = mmap(NULL,
-                      st->map_len,
-                      PROT_READ,
-                      MAP_SHARED,
-                      st->memfd,
-                      0);
-  if (st->map_base == MAP_FAILED) {
-    g_warning("mmap(memfd) failed: %s", g_strerror(errno));
-    stream_cleanup(st);
-    return;
-  }
-
-  st->hdr = (MetaFuriosMemfdHeader *)st->map_base;
-  memfd_dump_header("[initial]", st->hdr);
-
-  if (!memfd_header_sane(st->hdr)) {
-    g_warning("invalid memfd header");
-    stream_cleanup(st);
-    return;
-  }
-
-  st->last_seen_seq = st->hdr->seq;
-  st->last_presented_seq = st->hdr->seq;
-  st->inflight_flip_seq = 0;
-  st->force_full_damage = TRUE;
-
-  st->pending_seq = st->last_seen_seq;
-  st->pending_slot = st->hdr->last_slot;
 
   st->need_render_after_flip = FALSE;
 
   st->vblank_valid = FALSE;
   st->vblank_last_ns = 0;
+
   if (st->vblank_lead_ns == 0)
     st->vblank_lead_ns = 2000000;
 
@@ -607,9 +891,17 @@ connect_and_prepare_stream(StreamState *st)
                                                                 st,
                                                                 NULL);
 
+  g_print("[DBus] subscribed FrameReady (id=%u) and FrameReadyWithDamage (id=%u)\n",
+          st->signal_sub_id,
+          st->signal_sub_damage_id);
+
+  st->render_pending_cb = cb_render_pending;
+  st->flip_complete_cb = cb_flip_complete_native_request;
+  st->vblank_cb = cb_vblank_rearm;
+
   ensure_drm_ready(st);
 
-  if (st->request_timer_fd >= 0)
+  if (st->request_timer_fd >= 0 && st->backend != STREAM_BACKEND_NATIVE_BUFFER)
     stream_rearm_request_timer(st);
 
   render_or_defer(st);
@@ -620,6 +912,7 @@ static gboolean
 delayed_start_cb(gpointer data)
 {
   StreamState *st = data;
+
   st->delayed_start_id = 0;
 
   if (!st->service_present)
@@ -642,13 +935,14 @@ schedule_delayed_start(StreamState *st)
 
 static void
 on_name_appeared(GDBusConnection *connection,
-                 const gchar *name,
-                 const gchar *name_owner,
-                 gpointer user_data)
+                 const gchar     *name,
+                 const gchar     *name_owner,
+                 gpointer         user_data)
 {
   (void)connection;
 
   StreamState *st = user_data;
+
   g_print("[client] service appeared: %s owner=%s\n",
           name,
           name_owner ? name_owner : "(null)");
@@ -659,12 +953,13 @@ on_name_appeared(GDBusConnection *connection,
 
 static void
 on_name_vanished(GDBusConnection *connection,
-                 const gchar *name,
-                 gpointer user_data)
+                 const gchar     *name,
+                 gpointer         user_data)
 {
   (void)connection;
 
   StreamState *st = user_data;
+
   g_print("[client] service vanished: %s\n", name);
 
   st->service_present = FALSE;
@@ -676,14 +971,14 @@ setup_bus_and_watch(StreamState *st)
 {
   g_autoptr(GError) error = NULL;
 
-  g_print("[setup] connecting to session bus...\n");
-
   st->bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, &error);
   if (!st->bus) {
     g_warning("g_bus_get_sync failed: %s",
               error ? error->message : "unknown error");
     return;
   }
+
+  g_print("[DBus] connected to session bus\n");
 
   st->name_watch_id = g_bus_watch_name_on_connection(st->bus,
                                                      IFACE_SC,
@@ -692,6 +987,8 @@ setup_bus_and_watch(StreamState *st)
                                                      on_name_vanished,
                                                      st,
                                                      NULL);
+
+  g_print("[DBus] watching name %s (watch_id=%u)\n", IFACE_SC, st->name_watch_id);
 }
 
 void
@@ -719,11 +1016,13 @@ stream_cleanup(StreamState *st)
   }
 
   if (st->signal_sub_id && st->bus) {
+    g_print("[DBus] unsub FrameReady (id=%u)\n", st->signal_sub_id);
     g_dbus_connection_signal_unsubscribe(st->bus, st->signal_sub_id);
     st->signal_sub_id = 0;
   }
 
   if (st->signal_sub_damage_id && st->bus) {
+    g_print("[DBus] unsub FrameReadyWithDamage (id=%u)\n", st->signal_sub_damage_id);
     g_dbus_connection_signal_unsubscribe(st->bus, st->signal_sub_damage_id);
     st->signal_sub_damage_id = 0;
   }
@@ -745,16 +1044,45 @@ stream_cleanup(StreamState *st)
   }
 
   st->hdr = NULL;
+
+  drm_native_buffer_cleanup(st);
+
+  if (st->native_info) {
+    g_variant_unref(st->native_info);
+    st->native_info = NULL;
+  }
+
+  if (st->native_fds) {
+    for (int i = 0; i < st->native_n_fds; i++) {
+      if (st->native_fds[i] >= 0)
+        close(st->native_fds[i]);
+    }
+
+    g_free(st->native_fds);
+    st->native_fds = NULL;
+    st->native_n_fds = 0;
+  }
+
+  st->backend = STREAM_BACKEND_UNKNOWN;
+  st->info_width = 0;
+  st->info_height = 0;
+  st->info_fps = 0.0;
+
   st->last_seen_seq = 0;
   st->last_presented_seq = 0;
   st->inflight_flip_seq = 0;
   st->pending_seq = 0;
   st->pending_slot = 0;
+
   st->need_render_after_flip = FALSE;
   st->force_full_damage = TRUE;
 
   st->vblank_valid = FALSE;
   st->vblank_last_ns = 0;
+
+  st->render_pending_cb = NULL;
+  st->flip_complete_cb = NULL;
+  st->vblank_cb = NULL;
 
   if (st->cpu_buf) {
     g_free(st->cpu_buf);
@@ -777,6 +1105,7 @@ cleanup_all(StreamState *st)
   stream_cleanup(st);
 
   if (st->name_watch_id) {
+    g_print("[DBus] unwatch name (watch_id=%u)\n", st->name_watch_id);
     g_bus_unwatch_name(st->name_watch_id);
     st->name_watch_id = 0;
   }
