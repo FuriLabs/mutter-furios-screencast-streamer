@@ -3,8 +3,6 @@
  * Copyright (C) 2026 Bardia Moshiri <bardia@furilabs.com>
  */
 
-#include <gio/gio.h>
-
 #include "memfd.h"
 
 const char *
@@ -23,14 +21,14 @@ memfd_format_name(uint32_t fmt)
 }
 
 void
-memfd_dump_header(const char *tag,
+memfd_dump_header(const char                  *tag,
                   const MetaFuriosMemfdHeader *h)
 {
   if (!h)
     return;
 
   g_debug("%s hdr: magic=0x%08x version=%u wxh=%ux%u stride=%u fmt=%u(%s) n_slots=%u slot_bytes=%u header_bytes=%u last_slot=%u seq=%u pts_ns=%" G_GUINT64_FORMAT,
-          tag,
+          tag ? tag : "(null)",
           h->magic,
           h->version,
           h->width, h->height,
@@ -63,5 +61,6 @@ memfd_header_sane(const MetaFuriosMemfdHeader *h)
     return FALSE;
   if (h->header_bytes < sizeof(MetaFuriosMemfdHeader))
     return FALSE;
+
   return TRUE;
 }

@@ -3,8 +3,10 @@
  * Copyright (C) 2026 Bardia Moshiri <bardia@furilabs.com>
  */
 
-#ifndef DRM_H
-#define DRM_H
+#ifndef DRM_UTILS_H
+#define DRM_UTILS_H
+
+#include <glib.h>
 
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -53,7 +55,7 @@ typedef struct DrmSink
 /**
  * Release DRM resources associated with the sink.
  *
- * @param s  DRM sink to clean up
+ * @param s DRM sink to clean up
  */
 void
 drm_cleanup(DrmSink *s);
@@ -62,17 +64,20 @@ drm_cleanup(DrmSink *s);
  * Ensure DRM device is opened, a connector/mode is selected,
  * dumb buffers are created, and the CRTC is set.
  *
- * @param st  Stream state
+ * @param st Stream state
  */
 void
 ensure_drm_ready(StreamState *st);
 
 /**
- * Render the latest pending frame to DRM and page-flip on vblank.
+ * Compute the vblank period from mode timing.
  *
- * @param st  Stream state
+ * Falls back to approximately 60Hz when timing data is invalid.
+ *
+ * @param m DRM mode (may be NULL)
+ * @return Estimated vblank period in nanoseconds
  */
-void
-render_frame_drm(StreamState *st);
+guint64
+drm_compute_vblank_period_ns(const drmModeModeInfo *m);
 
-#endif // DRM_H
+#endif // DRM_UTILS_H

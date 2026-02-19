@@ -8,34 +8,86 @@
 
 #include <gio/gio.h>
 
-#include "drm.h"
+#include "drm_utils.h"
+#include "memfd.h"
+#include "utils.h"
 
-struct MetaFuriosMemfdHeader;
-typedef struct MetaFuriosMemfdHeader MetaFuriosMemfdHeader;
-
-typedef struct DamageRect
+typedef enum StreamBackendType
 {
-  int32_t x;
-  int32_t y;
-  int32_t w;
-  int32_t h;
-} DamageRect;
+  STREAM_BACKEND_UNKNOWN = 0,
+  STREAM_BACKEND_MEMFD = 1,
+  STREAM_BACKEND_NATIVE_BUFFER = 2,
+} StreamBackendType;
+
+typedef struct NativeSlotImport
+{
+  int prime_fd_index;
+  uint32_t gem_handle;
+  uint32_t fb_id;
+  uint32_t used_fmt;
+  uint64_t used_mod;
+  uint32_t pitch;
+} NativeSlotImport;
+
+struct StreamState;
+typedef struct StreamState StreamState;
 
 /**
- * StreamState holds the DBus session/stream objects, mapped memfd state,
- * and DRM sink state for displaying frames.
+ * Callback invoked from DRM page-flip handler when a render was deferred
+ * due to an in-flight flip.
+ *
+ * @param st Stream state
  */
-typedef struct StreamState
+typedef void (*StreamRenderPendingFunc)(StreamState *st);
+
+/**
+ * Callback invoked from DRM page-flip handler after bookkeeping is complete.
+ * Used to drive native-buffer pacing.
+ *
+ * @param st Stream state
+ */
+typedef void (*StreamFlipCompleteFunc)(StreamState *st);
+
+/**
+ * Callback invoked when vblank timestamp is updated, used to re-arm
+ * RequestFrame pacing for the memfd backend.
+ *
+ * @param st Stream state
+ */
+typedef void (*StreamVblankFunc)(StreamState *st);
+
+struct StreamState
 {
   GDBusConnection *bus;
 
   char *session_path;
   char *stream_path;
 
+  StreamBackendType backend;
+
+  guint32 info_width;
+  guint32 info_height;
+  double info_fps;
+
   int memfd;
   void *map_base;
   size_t map_len;
   MetaFuriosMemfdHeader *hdr;
+
+  GVariant *native_info;
+  int *native_fds;
+  int native_n_fds;
+
+  guint32 native_width;
+  guint32 native_height;
+  guint32 native_stride_pixels;
+  guint32 native_n_slots;
+
+  NativeSlotImport *native_slots;
+
+  gboolean native_modeset_done;
+  guint32 native_current_slot;
+  uint32_t native_current_fb_id;
 
   guint signal_sub_id;
   guint signal_sub_damage_id;
@@ -71,7 +123,11 @@ typedef struct StreamState
   guint64 vblank_period_ns;
   guint64 vblank_lead_ns;
 
+  StreamRenderPendingFunc render_pending_cb;
+  StreamFlipCompleteFunc flip_complete_cb;
+  StreamVblankFunc vblank_cb;
+
   DrmSink sink;
-} StreamState;
+};
 
 #endif // STREAM_H
