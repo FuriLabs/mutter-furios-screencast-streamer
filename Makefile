@@ -4,7 +4,7 @@ CFLAGS = `pkg-config --cflags gio-2.0 gio-unix-2.0 glib-2.0 libdrm` -Iinclude
 LDFLAGS = `pkg-config --libs gio-2.0 gio-unix-2.0 glib-2.0 libdrm`
 
 SOURCES = src/main.c src/dbus.c src/drm.c src/memfd.c
-TARGET = mutter-memfd-streamer
+TARGET = mutter-furios-screencast-streamer
 
 PREFIX ?= /usr
 
