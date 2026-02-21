@@ -7,6 +7,7 @@
 
 #include <glib-unix.h>
 
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/timerfd.h>
@@ -220,6 +221,169 @@ get_memfd_dbus(GDBusConnection *bus,
   return fd;
 }
 
+static int
+get_fence_dbus(GDBusConnection *bus,
+               const char      *stream_path,
+               guint32          slot)
+{
+  if (!bus || !stream_path)
+    return -1;
+
+  g_autoptr(GError) err = NULL;
+  g_autoptr(GUnixFDList) out_fds = NULL;
+
+  g_autoptr(GVariant) ret = g_dbus_connection_call_with_unix_fd_list_sync(bus,
+                                                                          IFACE_SC,
+                                                                          stream_path,
+                                                                          IFACE_STREAM,
+                                                                          "GetFence",
+                                                                          g_variant_new("(u)", slot),
+                                                                          NULL,
+                                                                          G_DBUS_CALL_FLAGS_NONE,
+                                                                          2000,
+                                                                          NULL,
+                                                                          &out_fds,
+                                                                          NULL,
+                                                                          &err);
+  if (!ret) {
+    g_debug("GetFence(slot=%u) failed: %s", slot, err ? err->message : "unknown error");
+    return -1;
+  }
+
+  gint handle_index = -1;
+  g_variant_get(ret, "(h)", &handle_index);
+
+  if (!out_fds || handle_index < 0) {
+    g_debug("GetFence(slot=%u) returned invalid handle index", slot);
+    return -1;
+  }
+
+  int fd = g_unix_fd_list_get(out_fds, handle_index, &err);
+  if (fd < 0) {
+    g_debug("GetFence(slot=%u) g_unix_fd_list_get failed: %s", slot, err ? err->message : "unknown");
+    return -1;
+  }
+
+  return fd;
+}
+
+static gboolean
+fence_is_signaled_now(int fd)
+{
+  if (fd < 0)
+    return TRUE;
+
+  struct pollfd pfd;
+  pfd.fd = fd;
+  pfd.events = POLLIN;
+  pfd.revents = 0;
+
+  int r;
+  do {
+    r = poll(&pfd, 1, 0);
+  } while (r < 0 && errno == EINTR);
+
+  return (r == 1);
+}
+
+static void
+render_or_defer(StreamState *st);
+
+static gboolean
+fence_fd_ready_cb(gint fd, GIOCondition cond, gpointer user_data)
+{
+  (void)fd;
+
+  StreamState *st = user_data;
+  if (!st)
+    return G_SOURCE_REMOVE;
+
+  /* any of IN/HUP/ERR: treat as "ready" and proceed. */
+  (void)cond;
+
+  if (st->fence_watch_source_id)
+    st->fence_watch_source_id = 0;
+
+  st->fence_waiting = FALSE;
+
+  if (st->pending_fence_fd >= 0) {
+    close(st->pending_fence_fd);
+    st->pending_fence_fd = -1;
+  }
+  st->pending_fence_seq = 0;
+  st->pending_fence_slot = 0;
+
+  /* now that the acquire fence is signaled, render. */
+  render_or_defer(st);
+
+  return G_SOURCE_REMOVE;
+}
+
+static void
+cancel_fence_wait(StreamState *st)
+{
+  if (!st)
+    return;
+
+  if (st->fence_watch_source_id) {
+    g_source_remove(st->fence_watch_source_id);
+    st->fence_watch_source_id = 0;
+  }
+
+  st->fence_waiting = FALSE;
+
+  if (st->pending_fence_fd >= 0) {
+    close(st->pending_fence_fd);
+    st->pending_fence_fd = -1;
+  }
+
+  st->pending_fence_seq = 0;
+  st->pending_fence_slot = 0;
+}
+
+static void
+arm_fence_wait_or_render(StreamState *st,
+                         guint32      seq,
+                         guint32      slot,
+                         int          fence_fd)
+{
+  if (!st)
+    return;
+
+  cancel_fence_wait(st);
+
+  if (fence_fd < 0) {
+    render_or_defer(st);
+    return;
+  }
+
+  st->pending_fence_fd = fence_fd;
+  st->pending_fence_seq = seq;
+  st->pending_fence_slot = slot;
+
+  /* if it's already signaled, skip the watch and render immediately. */
+  if (fence_is_signaled_now(fence_fd)) {
+    st->fence_waiting = FALSE;
+    close(st->pending_fence_fd);
+    st->pending_fence_fd = -1;
+    st->pending_fence_seq = 0;
+    st->pending_fence_slot = 0;
+
+    render_or_defer(st);
+    return;
+  }
+
+  /* otherwise, wait asynchronously */
+  st->fence_waiting = TRUE;
+
+  st->fence_watch_source_id = g_unix_fd_add_full(G_PRIORITY_HIGH,
+                                                 st->pending_fence_fd,
+                                                 (GIOCondition)(G_IO_IN | G_IO_HUP | G_IO_ERR),
+                                                 fence_fd_ready_cb,
+                                                 st,
+                                                 NULL);
+}
+
 static gboolean
 setup_memfd_backend(StreamState *st)
 {
@@ -352,6 +516,12 @@ setup_native_buffer_backend(StreamState *st)
   st->pending_seq = 0;
   st->pending_slot = 0;
 
+  st->pending_fence_fd = -1;
+  st->pending_fence_seq = 0;
+  st->pending_fence_slot = 0;
+  st->fence_watch_source_id = 0;
+  st->fence_waiting = FALSE;
+
   return TRUE;
 }
 
@@ -461,6 +631,10 @@ on_frame_ready_common(StreamState *st,
   if (seq <= st->last_seen_seq)
     return;
 
+  /* new frame: any old fence wait is obsolete. */
+  if (st->backend == STREAM_BACKEND_NATIVE_BUFFER)
+    cancel_fence_wait(st);
+
   if (st->sink.pending_flip)
     st->force_full_damage = TRUE;
 
@@ -481,9 +655,18 @@ on_frame_ready_common(StreamState *st,
       pending_damage_set_full(st);
   }
 
-  st->last_seen_seq = seq;
+  if (st->backend == STREAM_BACKEND_NATIVE_BUFFER) {
+    int ffd = get_fence_dbus(st->bus, st->stream_path, slot);
 
-  render_or_defer(st);
+    if (ffd >= 0)
+      g_debug("[GetFence] seq=%u slot=%u -> fence_fd=%d", seq, slot, ffd);
+
+    arm_fence_wait_or_render(st, seq, slot, ffd);
+  } else {
+    render_or_defer(st);
+  }
+
+  st->last_seen_seq = seq;
 }
 
 static void
@@ -999,6 +1182,8 @@ stream_cleanup(StreamState *st)
 
   st->streaming = FALSE;
   st->request_in_flight = FALSE;
+
+  cancel_fence_wait(st);
 
   if (st->request_timer_id) {
     g_source_remove(st->request_timer_id);

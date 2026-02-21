@@ -115,6 +115,12 @@ struct StreamState
   guint32 pending_slot;
   GArray *pending_damage;
 
+  int pending_fence_fd;
+  guint32 pending_fence_seq;
+  guint32 pending_fence_slot;
+  guint fence_watch_source_id;
+  gboolean fence_waiting;
+
   guint8 *cpu_buf;
   size_t cpu_buf_len;
 

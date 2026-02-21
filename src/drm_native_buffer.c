@@ -484,6 +484,9 @@ render_frame_drm_native_buffer(StreamState *st)
     return;
   }
 
+  if (st->fence_waiting)
+    return;
+
   if (s->pending_flip) {
     st->need_render_after_flip = TRUE;
     return;
