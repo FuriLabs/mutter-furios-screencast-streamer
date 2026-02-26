@@ -221,52 +221,6 @@ get_memfd_dbus(GDBusConnection *bus,
   return fd;
 }
 
-static int
-get_fence_dbus(GDBusConnection *bus,
-               const char      *stream_path,
-               guint32          slot)
-{
-  if (!bus || !stream_path)
-    return -1;
-
-  g_autoptr(GError) err = NULL;
-  g_autoptr(GUnixFDList) out_fds = NULL;
-
-  g_autoptr(GVariant) ret = g_dbus_connection_call_with_unix_fd_list_sync(bus,
-                                                                          IFACE_SC,
-                                                                          stream_path,
-                                                                          IFACE_STREAM,
-                                                                          "GetFence",
-                                                                          g_variant_new("(u)", slot),
-                                                                          NULL,
-                                                                          G_DBUS_CALL_FLAGS_NONE,
-                                                                          2000,
-                                                                          NULL,
-                                                                          &out_fds,
-                                                                          NULL,
-                                                                          &err);
-  if (!ret) {
-    g_debug("GetFence(slot=%u) failed: %s", slot, err ? err->message : "unknown error");
-    return -1;
-  }
-
-  gint handle_index = -1;
-  g_variant_get(ret, "(h)", &handle_index);
-
-  if (!out_fds || handle_index < 0) {
-    g_debug("GetFence(slot=%u) returned invalid handle index", slot);
-    return -1;
-  }
-
-  int fd = g_unix_fd_list_get(out_fds, handle_index, &err);
-  if (fd < 0) {
-    g_debug("GetFence(slot=%u) g_unix_fd_list_get failed: %s", slot, err ? err->message : "unknown");
-    return -1;
-  }
-
-  return fd;
-}
-
 static gboolean
 fence_is_signaled_now(int fd)
 {
@@ -292,14 +246,12 @@ render_or_defer(StreamState *st);
 static gboolean
 fence_fd_ready_cb(gint fd, GIOCondition cond, gpointer user_data)
 {
-  (void)fd;
-
   StreamState *st = user_data;
   if (!st)
     return G_SOURCE_REMOVE;
 
-  /* any of IN/HUP/ERR: treat as "ready" and proceed. */
-  (void)cond;
+  g_debug("[fence] fd ready (fd=%d cond=0x%x) seq=%u slot=%u",
+          fd, (unsigned)cond, st->pending_fence_seq, st->pending_fence_slot);
 
   if (st->fence_watch_source_id)
     st->fence_watch_source_id = 0;
@@ -353,6 +305,7 @@ arm_fence_wait_or_render(StreamState *st,
   cancel_fence_wait(st);
 
   if (fence_fd < 0) {
+    g_debug("[fence] seq=%u slot=%u: no fence fd, render immediately", seq, slot);
     render_or_defer(st);
     return;
   }
@@ -363,7 +316,11 @@ arm_fence_wait_or_render(StreamState *st,
 
   /* if it's already signaled, skip the watch and render immediately. */
   if (fence_is_signaled_now(fence_fd)) {
+    g_debug("[fence] seq=%u slot=%u: fence fd=%d already signaled, render now",
+            seq, slot, fence_fd);
+
     st->fence_waiting = FALSE;
+
     close(st->pending_fence_fd);
     st->pending_fence_fd = -1;
     st->pending_fence_seq = 0;
@@ -375,6 +332,9 @@ arm_fence_wait_or_render(StreamState *st,
 
   /* otherwise, wait asynchronously */
   st->fence_waiting = TRUE;
+
+  g_debug("[fence] seq=%u slot=%u: waiting on fence fd=%d",
+          seq, slot, fence_fd);
 
   st->fence_watch_source_id = g_unix_fd_add_full(G_PRIORITY_HIGH,
                                                  st->pending_fence_fd,
@@ -623,13 +583,17 @@ static void
 on_frame_ready_common(StreamState *st,
                       guint32      seq,
                       guint32      slot,
-                      GVariant    *damage_maybe)
+                      GVariant    *damage_maybe,
+                      int          fence_fd_maybe)
 {
   if (!st)
     return;
 
-  if (seq <= st->last_seen_seq)
+  if (seq <= st->last_seen_seq) {
+    if (fence_fd_maybe >= 0)
+      close(fence_fd_maybe);
     return;
+  }
 
   /* new frame: any old fence wait is obsolete. */
   if (st->backend == STREAM_BACKEND_NATIVE_BUFFER)
@@ -656,13 +620,11 @@ on_frame_ready_common(StreamState *st,
   }
 
   if (st->backend == STREAM_BACKEND_NATIVE_BUFFER) {
-    int ffd = get_fence_dbus(st->bus, st->stream_path, slot);
-
-    if (ffd >= 0)
-      g_debug("[GetFence] seq=%u slot=%u -> fence_fd=%d", seq, slot, ffd);
-
-    arm_fence_wait_or_render(st, seq, slot, ffd);
+    arm_fence_wait_or_render(st, seq, slot, fence_fd_maybe);
   } else {
+    /* not native-buffer: ignore any fence and render immediately */
+    if (fence_fd_maybe >= 0)
+      close(fence_fd_maybe);
     render_or_defer(st);
   }
 
@@ -693,7 +655,7 @@ on_frame_ready(GDBusConnection *connection,
           signal_name ? signal_name : "FrameReady",
           seq, slot);
 
-  on_frame_ready_common(st, seq, slot, NULL);
+  on_frame_ready_common(st, seq, slot, NULL, -1);
 }
 
 static void
@@ -721,10 +683,84 @@ on_frame_ready_with_damage(GDBusConnection *connection,
           signal_name ? signal_name : "FrameReadyWithDamage",
           seq, slot);
 
-  on_frame_ready_common(st, seq, slot, damage);
+  on_frame_ready_common(st, seq, slot, damage, -1);
 
   if (damage)
     g_variant_unref(damage);
+}
+
+static GDBusMessage *
+frame_ready_with_fence_filter_cb(GDBusConnection *connection,
+                                 GDBusMessage    *message,
+                                 gboolean         incoming,
+                                 gpointer         user_data)
+{
+  /*
+   * Unix file descriptors on D-Bus are out-of-band data carried in an attached
+   * GUnixFDList. GLib only exposes that FD list on the underlying GDBusMessage.
+   *
+   * The g_dbus_connection_signal_subscribe() callback provides only the decoded
+   * GVariant parameters, and not the GDBusMessage, so there is no
+   * way to access the GUnixFDList from a signal subscribe handler.
+   */
+
+  (void)connection;
+
+  if (!incoming || !message)
+    return message;
+
+  StreamState *st = user_data;
+  if (!st || !st->stream_path)
+    return message;
+
+  if (g_dbus_message_get_message_type(message) != G_DBUS_MESSAGE_TYPE_SIGNAL)
+    return message;
+
+  const char *path = g_dbus_message_get_path(message);
+  const char *iface = g_dbus_message_get_interface(message);
+  const char *member = g_dbus_message_get_member(message);
+
+  if (!path || !iface || !member)
+    return message;
+
+  if (strcmp(path, st->stream_path) != 0)
+    return message;
+  if (strcmp(iface, IFACE_STREAM) != 0)
+    return message;
+  if (strcmp(member, "FrameReadyWithFence") != 0)
+    return message;
+
+  GVariant *body = g_dbus_message_get_body(message);
+  if (!body || !g_variant_is_of_type(body, G_VARIANT_TYPE("(uuh)")))
+    return message;
+
+  guint32 seq = 0;
+  guint32 slot = 0;
+  gint32 handle_index = -1;
+  g_variant_get(body, "(uuh)", &seq, &slot, &handle_index);
+
+  g_autoptr(GError) err = NULL;
+  GUnixFDList *fd_list = g_dbus_message_get_unix_fd_list(message);
+
+  int fence_fd = -1;
+  if (fd_list && handle_index >= 0) {
+    fence_fd = g_unix_fd_list_get(fd_list, handle_index, &err);
+    if (fence_fd < 0) {
+      g_debug("FrameReadyWithFence: g_unix_fd_list_get(%d) failed: %s",
+              handle_index, err ? err->message : "unknown");
+      g_clear_error(&err);
+      fence_fd = -1;
+    }
+  } else {
+    g_debug("FrameReadyWithFence: missing fd_list or invalid handle_index=%d", handle_index);
+  }
+
+  g_debug("[signal] FrameReadyWithFence(seq=%u slot=%u handle=%d fence_fd=%d)",
+          seq, slot, handle_index, fence_fd);
+
+  on_frame_ready_common(st, seq, slot, NULL, fence_fd);
+
+  return message;
 }
 
 void
@@ -1074,9 +1110,16 @@ connect_and_prepare_stream(StreamState *st)
                                                                 st,
                                                                 NULL);
 
-  g_print("[DBus] subscribed FrameReady (id=%u) and FrameReadyWithDamage (id=%u)\n",
+  if (st->fence_signal_filter_id == 0)
+    st->fence_signal_filter_id = g_dbus_connection_add_filter(st->bus,
+                                                              frame_ready_with_fence_filter_cb,
+                                                              st,
+                                                              NULL);
+
+  g_print("[DBus] subscribed FrameReady (id=%u), FrameReadyWithDamage (id=%u), and FrameReadyWithFence(filter_id=%u)\n",
           st->signal_sub_id,
-          st->signal_sub_damage_id);
+          st->signal_sub_damage_id,
+          st->fence_signal_filter_id);
 
   st->render_pending_cb = cb_render_pending;
   st->flip_complete_cb = cb_flip_complete_native_request;
@@ -1210,6 +1253,12 @@ stream_cleanup(StreamState *st)
     g_print("[DBus] unsub FrameReadyWithDamage (id=%u)\n", st->signal_sub_damage_id);
     g_dbus_connection_signal_unsubscribe(st->bus, st->signal_sub_damage_id);
     st->signal_sub_damage_id = 0;
+  }
+
+  if (st->fence_signal_filter_id && st->bus) {
+    g_print("[DBus] remove FrameReadyWithFence filter (id=%u)\n", st->fence_signal_filter_id);
+    g_dbus_connection_remove_filter(st->bus, st->fence_signal_filter_id);
+    st->fence_signal_filter_id = 0;
   }
 
   if (st->pending_damage) {

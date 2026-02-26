@@ -91,6 +91,7 @@ struct StreamState
 
   guint signal_sub_id;
   guint signal_sub_damage_id;
+  guint fence_signal_filter_id;
 
   guint request_timer_id;
   int request_timer_fd;
