@@ -12,4 +12,5 @@ Vcs-Git: https://github.com/furilabs/mutter-furios-screencast-streamer.git
 Package: mutter-furios-screencast-streamer
 Architecture: any
 Depends: ${misc:Depends}, ${shlibs:Depends},
+         mutter,
 Description: Mutter FuriOS screencast streamer to DRM
