@@ -462,16 +462,15 @@ on_frame_ready_common(StreamState *st,
   if (!st)
     return;
 
-  if (seq <= st->last_seen_seq)
+  if ((gint32)(seq - st->last_seen_seq) <= 0)
     return;
 
   if (st->sink.pending_flip)
     st->force_full_damage = TRUE;
 
-  if (st->last_presented_seq != 0) {
-    if (seq > st->last_presented_seq + 1)
-      st->force_full_damage = TRUE;
-  }
+  if (st->last_presented_seq != 0 &&
+      seq - st->last_presented_seq > 1)
+    st->force_full_damage = TRUE;
 
   st->pending_seq = seq;
   st->pending_slot = slot;
