@@ -102,6 +102,7 @@ struct StreamState
   gboolean service_present;
   gboolean streaming;
   gboolean request_in_flight;
+  gboolean request_again;
 
   guint32 last_seen_seq;
   guint32 last_presented_seq;

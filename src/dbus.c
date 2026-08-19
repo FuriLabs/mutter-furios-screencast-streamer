@@ -617,6 +617,8 @@ on_request_frame_done(GObject      *source_object,
   if (!ret) {
     g_warning("RequestFrame async error: %s",
               err ? err->message : "unknown error");
+
+    st->request_again = FALSE;
     return;
   }
 
@@ -624,7 +626,19 @@ on_request_frame_done(GObject      *source_object,
 
   g_variant_unref(ret);
 
-  if (st->request_timer_fd >= 0 && st->backend != STREAM_BACKEND_NATIVE_BUFFER)
+  /*
+   * native-buffer backend may have asked for another frame when the
+   * previous RequestFrame call was still completing
+   */
+  if (st->backend == STREAM_BACKEND_NATIVE_BUFFER &&
+      st->streaming &&
+      st->request_again) {
+    request_next_frame(st);
+    return;
+  }
+
+  if (st->request_timer_fd >= 0 &&
+      st->backend != STREAM_BACKEND_NATIVE_BUFFER)
     stream_rearm_request_timer(st);
 }
 
@@ -633,12 +647,17 @@ request_next_frame(StreamState *st)
 {
   if (!st || !st->bus || !st->stream_path)
     return;
+
   if (!st->streaming)
     return;
-  if (st->request_in_flight)
+
+  if (st->request_in_flight) {
+    st->request_again = TRUE;
     return;
+  }
 
   st->request_in_flight = TRUE;
+  st->request_again = FALSE;
 
   g_debug("[RequestFrame] calling on %s", st->stream_path);
 
@@ -712,6 +731,7 @@ start_streaming(StreamState *st)
 
   st->streaming = TRUE;
   st->request_in_flight = FALSE;
+  st->request_again = FALSE;
 
   if (st->backend == STREAM_BACKEND_NATIVE_BUFFER) {
     request_next_frame(st);
@@ -719,13 +739,16 @@ start_streaming(StreamState *st)
   }
 
   if (st->request_timer_fd < 0) {
-    st->request_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    st->request_timer_fd = timerfd_create(CLOCK_MONOTONIC,
+                                          TFD_NONBLOCK | TFD_CLOEXEC);
 
     if (st->request_timer_fd >= 0) {
       if (!st->request_timer_source_id)
         st->request_timer_source_id = g_unix_fd_add_full(G_PRIORITY_HIGH,
                                                          st->request_timer_fd,
-                                                         (GIOCondition)(G_IO_IN | G_IO_HUP | G_IO_ERR),
+                                                         (GIOCondition)(G_IO_IN |
+                                                                        G_IO_HUP |
+                                                                        G_IO_ERR),
                                                          request_timerfd_cb,
                                                          st,
                                                          NULL);
@@ -743,7 +766,9 @@ start_streaming(StreamState *st)
 
   if (st->request_timer_fd < 0) {
     if (!st->request_timer_id)
-      st->request_timer_id = g_timeout_add(REQUEST_INTERVAL_MS, request_frame_tick, st);
+      st->request_timer_id = g_timeout_add(REQUEST_INTERVAL_MS,
+                                           request_frame_tick,
+                                           st);
   }
 }
 
@@ -755,16 +780,6 @@ cb_vblank_rearm(StreamState *st)
 
   if (st->backend != STREAM_BACKEND_NATIVE_BUFFER)
     stream_rearm_request_timer(st);
-}
-
-static void
-cb_flip_complete_native_request(StreamState *st)
-{
-  if (!st)
-    return;
-
-  if (st->backend == STREAM_BACKEND_NATIVE_BUFFER && st->streaming)
-    request_next_frame(st);
 }
 
 static void
@@ -899,7 +914,7 @@ connect_and_prepare_stream(StreamState *st)
           st->signal_sub_damage_id);
 
   st->render_pending_cb = cb_render_pending;
-  st->flip_complete_cb = cb_flip_complete_native_request;
+  st->flip_complete_cb = NULL;
   st->vblank_cb = cb_vblank_rearm;
 
   ensure_drm_ready(st);
@@ -1002,6 +1017,7 @@ stream_cleanup(StreamState *st)
 
   st->streaming = FALSE;
   st->request_in_flight = FALSE;
+  st->request_again = FALSE;
 
   if (st->request_timer_id) {
     g_source_remove(st->request_timer_id);

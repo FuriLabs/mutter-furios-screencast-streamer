@@ -7,6 +7,7 @@
 #include "drm_utils.h"
 #include "stream.h"
 #include "utils.h"
+#include "dbus.h"
 
 typedef enum
 {
@@ -533,4 +534,12 @@ render_frame_drm_native_buffer(StreamState *st)
   st->native_current_fb_id = imp->fb_id;
 
   st->force_full_damage = FALSE;
+
+  /*
+   * as DRM is waiting for the next vblank, start producing the next frame
+   * if that frame becomes ready before this flip completes,
+   * render_or_defer() will keep it pending until the pageflip
+   */
+  if (st->streaming)
+    request_next_frame(st);
 }
