@@ -402,34 +402,75 @@ get_wanted_mode_size(StreamState *st,
 void
 ensure_drm_ready(StreamState *st)
 {
+  if (!st)
+    return;
+
   DrmSink *s = &st->sink;
 
-  if (s->drm_fd >= 0 &&
-      s->bufs[0].fb_id &&
-      s->bufs[1].fb_id &&
-      s->bufs[0].map &&
-      s->bufs[1].map)
-    return;
+  /* native-buffer backend scans out imported dma-buf/native buffers */
+  if (st->backend == STREAM_BACKEND_NATIVE_BUFFER) {
+    if (s->drm_fd >= 0 && s->have_mode) {
+      if (!s->drm_source_id)
+        s->drm_source_id = g_unix_fd_add_full(G_PRIORITY_HIGH,
+                                              s->drm_fd,
+                                              (GIOCondition)(G_IO_IN |
+                                                             G_IO_HUP |
+                                                             G_IO_ERR |
+                                              G_IO_NVAL),
+                                              drm_fd_ready_cb,
+                                              st,
+                                              NULL);
 
-  char path[64];
+      return;
+    }
+  } else {
+    /* memfd backend uses two dumb buffers for CPU copies and scanout */
+    if (s->drm_fd >= 0 &&
+        s->have_mode &&
+        s->bufs[0].fb_id &&
+        s->bufs[1].fb_id &&
+        s->bufs[0].map &&
+        s->bufs[1].map) {
+      if (!s->drm_source_id)
+        s->drm_source_id = g_unix_fd_add_full(G_PRIORITY_HIGH,
+                                              s->drm_fd,
+                                              (GIOCondition)(G_IO_IN |
+                                                             G_IO_HUP |
+                                                             G_IO_ERR |
+                                                             G_IO_NVAL),
+                                              drm_fd_ready_cb,
+                                              st,
+                                              NULL);
 
-  snprintf(path, sizeof(path), "/dev/dri/card%d", s->card_index);
-
-  s->drm_fd = open(path, O_RDWR | O_CLOEXEC);
-  if (s->drm_fd < 0) {
-    g_warning("open %s failed: %s", path, g_strerror(errno));
-    return;
+      return;
+    }
   }
 
-  for (int tries = 0; tries < 50; tries++) {
-    uint32_t want_w = 1920;
-    uint32_t want_h = 1080;
+  if (s->drm_fd < 0) {
+    char path[64];
 
-    get_wanted_mode_size(st, &want_w, &want_h);
-    if (pick_connector_mode_and_crtc(s, want_w, want_h) == 0)
-      break;
+    snprintf(path, sizeof(path), "/dev/dri/card%d", s->card_index);
 
-    usleep(100 * 1000);
+    s->drm_fd = open(path, O_RDWR | O_CLOEXEC);
+
+    if (s->drm_fd < 0) {
+      g_warning("open %s failed: %s", path, g_strerror(errno));
+      return;
+    }
+  }
+
+  if (!s->have_mode) {
+    for (int tries = 0; tries < 50; tries++) {
+      uint32_t want_w = 1920;
+      uint32_t want_h = 1080;
+
+      get_wanted_mode_size(st, &want_w, &want_h);
+
+      if (pick_connector_mode_and_crtc(s, want_w, want_h) == 0)
+        break;
+
+      usleep(100 * 1000);
+    }
   }
 
   if (!s->have_mode) {
@@ -442,50 +483,83 @@ ensure_drm_ready(StreamState *st)
     return;
   }
 
-  if (create_dumb_xrgb8888_one(s, &s->bufs[0], s->mode.hdisplay, s->mode.vdisplay) != 0) {
-    g_warning("[drm] create dumb buffer 0 failed: %s", g_strerror(errno));
-    drm_cleanup(s);
-    return;
+  /*
+   * native-buffer backend performs its initial modeset using the first imported
+   * native buffer in native_modeset_if_needed(). no need to allocare or modeset
+   * a temporary dumb framebuffer here.
+   */
+  if (st->backend != STREAM_BACKEND_NATIVE_BUFFER) {
+    if (!s->bufs[0].fb_id) {
+      if (create_dumb_xrgb8888_one(s,
+                                   &s->bufs[0],
+                                   s->mode.hdisplay,
+                                   s->mode.vdisplay) != 0) {
+        g_warning("[drm] create dumb buffer 0 failed: %s", g_strerror(errno));
+        drm_cleanup(s);
+        return;
+      }
+    }
+
+    if (!s->bufs[1].fb_id) {
+      if (create_dumb_xrgb8888_one(s,
+                                   &s->bufs[1],
+                                   s->mode.hdisplay,
+                                   s->mode.vdisplay) != 0) {
+        g_warning("[drm] create dumb buffer 1 failed: %s", g_strerror(errno));
+        drm_cleanup(s);
+        return;
+      }
+    }
+
+    s->fb_w = s->mode.hdisplay;
+    s->fb_h = s->mode.vdisplay;
+
+    s->front_idx = 0;
+    s->pending_flip = 0;
+    s->pending_flip_next_front = 0;
+
+    if (drm_set_mode(s, s->bufs[s->front_idx].fb_id) != 0) {
+      g_warning("[drm] drmModeSetCrtc failed: %s",
+                g_strerror(errno));
+      drm_cleanup(s);
+      return;
+    }
+  } else {
+    s->fb_w = s->mode.hdisplay;
+    s->fb_h = s->mode.vdisplay;
+
+    s->front_idx = 0;
+    s->pending_flip = 0;
+    s->pending_flip_next_front = 0;
   }
 
-  if (create_dumb_xrgb8888_one(s, &s->bufs[1], s->mode.hdisplay, s->mode.vdisplay) != 0) {
-    g_warning("[drm] create dumb buffer 1 failed: %s", g_strerror(errno));
-    drm_cleanup(s);
-    return;
-  }
+  st->vblank_period_ns = compute_vblank_period_ns_internal(&s->mode);
 
-  s->fb_w = s->mode.hdisplay;
-  s->fb_h = s->mode.vdisplay;
+  if (st->vblank_lead_ns == 0)
+    st->vblank_lead_ns = 2000000;
 
-  s->front_idx = 0;
-  s->pending_flip = 0;
-  s->pending_flip_next_front = 0;
-
-  if (drm_set_mode(s, s->bufs[s->front_idx].fb_id) != 0) {
-    g_warning("[drm] drmModeSetCrtc failed: %s", g_strerror(errno));
-    drm_cleanup(s);
-    return;
-  }
-
-  if (st) {
-    st->vblank_period_ns = compute_vblank_period_ns_internal(&s->mode);
-    if (st->vblank_lead_ns == 0)
-      st->vblank_lead_ns = 2000000;
-    if (st->vblank_lead_ns > st->vblank_period_ns / 2)
-      st->vblank_lead_ns = st->vblank_period_ns / 2;
-  }
+  if (st->vblank_lead_ns > st->vblank_period_ns / 2)
+    st->vblank_lead_ns = st->vblank_period_ns / 2;
 
   if (!s->drm_source_id)
     s->drm_source_id = g_unix_fd_add_full(G_PRIORITY_HIGH,
                                           s->drm_fd,
-                                          (GIOCondition)(G_IO_IN | G_IO_HUP | G_IO_ERR),
+                                          (GIOCondition)(G_IO_IN |
+                                                         G_IO_HUP |
+                                                         G_IO_ERR |
+                                                         G_IO_NVAL),
                                           drm_fd_ready_cb,
                                           st,
                                           NULL);
 
-  g_print("[drm] ready: %ux%u front_fb=%u pitch=%u\n",
-          s->mode.hdisplay,
-          s->mode.vdisplay,
-          s->bufs[s->front_idx].fb_id,
-          s->bufs[s->front_idx].pitch);
+  if (st->backend == STREAM_BACKEND_NATIVE_BUFFER)
+    g_print("[drm] ready: %ux%u native-buffer mode\n",
+            s->mode.hdisplay,
+            s->mode.vdisplay);
+  else
+    g_print("[drm] ready: %ux%u front_fb=%u pitch=%u\n",
+            s->mode.hdisplay,
+            s->mode.vdisplay,
+            s->bufs[s->front_idx].fb_id,
+            s->bufs[s->front_idx].pitch);
 }
