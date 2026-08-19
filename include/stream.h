@@ -64,6 +64,7 @@ struct StreamState
   char *stream_path;
 
   StreamBackendType backend;
+  StreamBackendType backend_override;
 
   guint32 info_width;
   guint32 info_height;

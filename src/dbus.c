@@ -822,6 +822,17 @@ connect_and_prepare_stream(StreamState *st)
 
   g_variant_builder_init(&b, G_VARIANT_TYPE("a{sv}"));
 
+  if (st->backend_override == STREAM_BACKEND_MEMFD)
+    g_variant_builder_add(&b,
+                          "{sv}",
+                          "backend",
+                          g_variant_new_string("memfd"));
+  else if (st->backend_override == STREAM_BACKEND_NATIVE_BUFFER)
+    g_variant_builder_add(&b,
+                          "{sv}",
+                          "backend",
+                          g_variant_new_string("native-buffer"));
+
   GVariant *sprops = g_variant_ref_sink(g_variant_builder_end(&b));
 
   g_autoptr(GVariant) ret_create_stream = call_sync(st->bus,
@@ -859,6 +870,28 @@ connect_and_prepare_stream(StreamState *st)
     backend_from_info(info, st);
   else
     st->backend = STREAM_BACKEND_MEMFD;
+
+  if (st->backend_override != STREAM_BACKEND_UNKNOWN &&
+      st->backend != st->backend_override) {
+    const char *requested;
+    const char *actual;
+
+    if (st->backend_override == STREAM_BACKEND_MEMFD)
+      requested = "memfd";
+    else
+      requested = "native-buffer";
+
+    if (st->backend == STREAM_BACKEND_MEMFD)
+      actual = "memfd";
+    else if (st->backend == STREAM_BACKEND_NATIVE_BUFFER)
+      actual = "native-buffer";
+    else
+      actual = "unknown";
+
+    g_warning("[backend] requested %s but Mutter created %s",
+              requested,
+              actual);
+  }
 
   if (st->backend == STREAM_BACKEND_NATIVE_BUFFER) {
     if (!setup_native_buffer_backend(st)) {
@@ -919,7 +952,8 @@ connect_and_prepare_stream(StreamState *st)
 
   ensure_drm_ready(st);
 
-  if (st->request_timer_fd >= 0 && st->backend != STREAM_BACKEND_NATIVE_BUFFER)
+  if (st->request_timer_fd >= 0 &&
+      st->backend != STREAM_BACKEND_NATIVE_BUFFER)
     stream_rearm_request_timer(st);
 
   render_or_defer(st);
