@@ -332,11 +332,20 @@ drm_fd_ready_cb(gint         fd,
                 GIOCondition cond,
                 gpointer     user_data)
 {
-  (void)fd;
-
   StreamState *st = user_data;
+
   if (!st)
-    return G_SOURCE_CONTINUE;
+    return G_SOURCE_REMOVE;
+
+  if (cond & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) {
+    g_warning("[drm] fd=%d error condition: 0x%x",
+              fd,
+              (unsigned int)cond);
+
+    st->sink.drm_source_id = 0;
+
+    return G_SOURCE_REMOVE;
+  }
 
   if (!(cond & G_IO_IN))
     return G_SOURCE_CONTINUE;
@@ -347,7 +356,10 @@ drm_fd_ready_cb(gint         fd,
   ev.version = DRM_EVENT_CONTEXT_VERSION;
   ev.page_flip_handler = drm_page_flip_handler;
 
-  drmHandleEvent(st->sink.drm_fd, &ev);
+  if (drmHandleEvent(st->sink.drm_fd, &ev) != 0)
+    g_warning("[drm] drmHandleEvent failed: %s",
+              g_strerror(errno));
+
   return G_SOURCE_CONTINUE;
 }
 
