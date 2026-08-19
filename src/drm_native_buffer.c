@@ -68,17 +68,24 @@ native_lookup_i32(GVariant   *dict,
 }
 
 static gboolean
-native_lookup_str(GVariant     *dict,
-                  const char   *key,
-                  const char  **out)
+native_lookup_str(GVariant    *dict,
+                  const char  *key,
+                  char       **out)
 {
-  GVariant *v = g_variant_lookup_value(dict, key, G_VARIANT_TYPE_STRING);
+  GVariant *v;
+
+  if (!dict || !key || !out)
+    return FALSE;
+
+  v = g_variant_lookup_value(dict, key, G_VARIANT_TYPE_STRING);
   if (!v)
     return FALSE;
 
-  *out = g_variant_get_string(v, NULL);
+  *out = g_variant_dup_string(v, NULL);
+
   g_variant_unref(v);
-  return TRUE;
+
+  return *out != NULL;
 }
 
 static gboolean
@@ -208,8 +215,11 @@ native_init_from_info(StreamState *st)
   if (!st || !st->native_info)
     return FALSE;
 
-  guint32 w = 0, h = 0, n = 0, stride = 0;
-  const char *type = NULL;
+  guint32 w = 0;
+  guint32 h = 0;
+  guint32 n = 0;
+  guint32 stride = 0;
+  g_autofree char *type = NULL;
 
   if (!native_lookup_str(st->native_info, "type", &type))
     return FALSE;

@@ -20,18 +20,22 @@
 static gboolean
 dbus_variant_lookup_string(GVariant    *dict,
                            const char  *key,
-                           const char **out_str)
+                           char       **out_str)
 {
+  GVariant *v;
+
   if (!dict || !key || !out_str)
     return FALSE;
 
-  GVariant *v = g_variant_lookup_value(dict, key, G_VARIANT_TYPE_STRING);
+  v = g_variant_lookup_value(dict, key, G_VARIANT_TYPE_STRING);
   if (!v)
     return FALSE;
 
-  *out_str = g_variant_get_string(v, NULL);
+  *out_str = g_variant_dup_string(v, NULL);
+
   g_variant_unref(v);
-  return TRUE;
+
+  return *out_str != NULL;
 }
 
 static gboolean
@@ -125,7 +129,7 @@ backend_from_info(GVariant    *info,
   st->info_height = 0;
   st->info_fps = 0.0;
 
-  const char *type_str = NULL;
+  g_autofree char *type_str = NULL;
 
   if (info) {
     if (dbus_variant_lookup_string(info, "type", &type_str) && type_str) {
