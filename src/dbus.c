@@ -55,6 +55,37 @@ dbus_variant_lookup_u32(GVariant   *dict,
   return TRUE;
 }
 
+static const char *
+backend_name(StreamBackendType backend)
+{
+  switch (backend) {
+  case STREAM_BACKEND_MEMFD:
+    return "memfd";
+  case STREAM_BACKEND_NATIVE_BUFFER:
+    return "native-buffer";
+  case STREAM_BACKEND_UNKNOWN:
+  default:
+    return "unknown";
+  }
+}
+
+static gboolean
+sequence_after(guint32 a,
+               guint32 b)
+{
+  return (gint32)(a - b) > 0;
+}
+
+static gboolean
+sequence_skipped(guint32 current,
+                 guint32 previous)
+{
+  if (previous == 0)
+    return FALSE;
+
+  return current - previous > 1;
+}
+
 static GVariant *
 call_sync(GDBusConnection *bus,
           const char     *dest,
@@ -155,12 +186,8 @@ backend_from_info(GVariant    *info,
     }
   }
 
-  const char *backend_str = (st->backend == STREAM_BACKEND_MEMFD) ? "memfd" :
-                            (st->backend == STREAM_BACKEND_NATIVE_BUFFER) ? "native-buffer" :
-                            "unknown";
-
   g_print("[GetInfo] backend=%s width=%u height=%u fps=%f\n",
-          backend_str,
+          backend_name(st->backend),
           st->info_width,
           st->info_height,
           st->info_fps);
@@ -230,43 +257,43 @@ setup_memfd_backend(StreamState *st)
   if (!st || !st->bus || !st->stream_path)
     return FALSE;
 
-  st->memfd = get_memfd_dbus(st->bus, st->stream_path);
-  if (st->memfd < 0)
+  st->memfd.fd = get_memfd_dbus(st->bus, st->stream_path);
+  if (st->memfd.fd < 0)
     return FALSE;
 
   struct stat stbuf;
 
-  if (fstat(st->memfd, &stbuf) != 0) {
+  if (fstat(st->memfd.fd, &stbuf) != 0) {
     g_warning("fstat(memfd) failed: %s", g_strerror(errno));
     return FALSE;
   }
 
-  st->map_len = (size_t)stbuf.st_size;
-  st->map_base = mmap(NULL,
-                      st->map_len,
-                      PROT_READ,
-                      MAP_SHARED,
-                      st->memfd,
-                      0);
-  if (st->map_base == MAP_FAILED) {
+  st->memfd.map_len = (size_t)stbuf.st_size;
+  st->memfd.map_base = mmap(NULL,
+                            st->memfd.map_len,
+                            PROT_READ,
+                            MAP_SHARED,
+                            st->memfd.fd,
+                            0);
+  if (st->memfd.map_base == MAP_FAILED) {
     g_warning("mmap(memfd) failed: %s", g_strerror(errno));
     return FALSE;
   }
 
-  st->hdr = (MetaFuriosMemfdHeader *)st->map_base;
+  st->memfd.hdr = (MetaFuriosMemfdHeader *)st->memfd.map_base;
 
-  if (!memfd_header_sane(st->hdr)) {
+  if (!memfd_header_sane(st->memfd.hdr)) {
     g_warning("invalid memfd header");
     return FALSE;
   }
 
-  st->last_seen_seq = st->hdr->seq;
-  st->last_presented_seq = st->hdr->seq;
+  st->last_seen_seq = st->memfd.hdr->seq;
+  st->last_presented_seq = st->memfd.hdr->seq;
   st->inflight_flip_seq = 0;
   st->force_full_damage = TRUE;
 
   st->pending_seq = st->last_seen_seq;
-  st->pending_slot = st->hdr->last_slot;
+  st->pending_slot = st->memfd.hdr->last_slot;
 
   return TRUE;
 }
@@ -310,41 +337,41 @@ setup_native_buffer_backend(StreamState *st)
     return FALSE;
   }
 
-  if (st->native_info)
-    g_variant_unref(st->native_info);
+  if (st->native.info)
+    g_variant_unref(st->native.info);
 
-  st->native_info = g_variant_ref(dict);
+  st->native.info = g_variant_ref(dict);
   g_variant_unref(dict);
 
   int n = out_fds ? g_unix_fd_list_get_length(out_fds) : 0;
 
-  st->native_n_fds = 0;
-  g_clear_pointer(&st->native_fds, g_free);
+  st->native.n_fds = 0;
+  g_clear_pointer(&st->native.fds, g_free);
 
   if (n > 0) {
-    st->native_fds = g_new0(int, n);
+    st->native.fds = g_new0(int, n);
 
     for (int i = 0; i < n; i++) {
       int fd = g_unix_fd_list_get(out_fds, i, &err);
       if (fd < 0) {
         g_warning("g_unix_fd_list_get(%d) failed: %s", i, err ? err->message : "unknown");
-        st->native_fds[i] = -1;
+        st->native.fds[i] = -1;
         g_clear_error(&err);
         continue;
       }
 
-      st->native_fds[i] = fd;
+      st->native.fds[i] = fd;
     }
 
-    st->native_n_fds = n;
+    st->native.n_fds = n;
   }
 
-  st->native_slots = NULL;
-  st->native_n_slots = 0;
-  st->native_stride_pixels = 0;
-  st->native_width = 0;
-  st->native_height = 0;
-  st->native_modeset_done = FALSE;
+  st->native.slots = NULL;
+  st->native.n_slots = 0;
+  st->native.stride_pixels = 0;
+  st->native.width = 0;
+  st->native.height = 0;
+  st->native.modeset_done = FALSE;
 
   st->last_seen_seq = 0;
   st->last_presented_seq = 0;
@@ -371,9 +398,9 @@ pending_damage_set_full(StreamState *st)
   guint32 w = 0;
   guint32 h = 0;
 
-  if (st->backend == STREAM_BACKEND_MEMFD && st->hdr) {
-    w = st->hdr->width;
-    h = st->hdr->height;
+  if (st->backend == STREAM_BACKEND_MEMFD && st->memfd.hdr) {
+    w = st->memfd.hdr->width;
+    h = st->memfd.hdr->height;
   } else {
     w = st->info_width;
     h = st->info_height;
@@ -460,15 +487,12 @@ on_frame_ready_common(StreamState *st,
   if (!st)
     return;
 
-  if ((gint32)(seq - st->last_seen_seq) <= 0)
+  if (!sequence_after(seq, st->last_seen_seq))
     return;
 
-  if (st->sink.pending_flip)
-    st->force_full_damage = TRUE;
-
-  if (st->last_presented_seq != 0 &&
-      seq - st->last_presented_seq > 1)
-    st->force_full_damage = TRUE;
+    if (st->sink.pending_flip ||
+        sequence_skipped(seq, st->last_presented_seq))
+      st->force_full_damage = TRUE;
 
   st->pending_seq = seq;
   st->pending_slot = slot;
@@ -786,82 +810,92 @@ cb_render_pending(StreamState *st)
   render_or_defer(st);
 }
 
-static void
-connect_and_prepare_stream(StreamState *st)
+static gboolean
+create_session(StreamState *st)
 {
-  if (!st || !st->bus)
-    return;
-
-  stream_cleanup(st);
-
   GVariantBuilder b;
 
   g_variant_builder_init(&b, G_VARIANT_TYPE("a{sv}"));
 
   GVariant *props = g_variant_ref_sink(g_variant_builder_end(&b));
 
-  g_autoptr(GVariant) ret_create_session = call_sync(st->bus,
-                                                     IFACE_SC,
-                                                     IFACE_PATH,
-                                                     IFACE_SC,
-                                                     "CreateSession",
-                                                     g_variant_new("(@a{sv})", props));
+  g_autoptr(GVariant) ret = call_sync(st->bus,
+                                      IFACE_SC,
+                                      IFACE_PATH,
+                                      IFACE_SC,
+                                      "CreateSession",
+                                      g_variant_new("(@a{sv})", props));
   g_variant_unref(props);
 
-  if (!ret_create_session)
-    return;
+  if (!ret)
+    return FALSE;
 
   const char *session_path_tmp = NULL;
 
-  g_variant_get(ret_create_session, "(&o)", &session_path_tmp);
+  g_variant_get(ret, "(&o)", &session_path_tmp);
   st->session_path = g_strdup(session_path_tmp);
 
   g_print("[DBus] CreateSession -> %s\n", st->session_path);
 
+  return TRUE;
+}
+
+static gboolean
+create_stream(StreamState *st)
+{
+  GVariantBuilder b;
+
   g_variant_builder_init(&b, G_VARIANT_TYPE("a{sv}"));
 
-  if (st->backend_override == STREAM_BACKEND_MEMFD)
+  if (st->backend_override != STREAM_BACKEND_UNKNOWN)
     g_variant_builder_add(&b,
                           "{sv}",
                           "backend",
-                          g_variant_new_string("memfd"));
-  else if (st->backend_override == STREAM_BACKEND_NATIVE_BUFFER)
-    g_variant_builder_add(&b,
-                          "{sv}",
-                          "backend",
-                          g_variant_new_string("native-buffer"));
+                          g_variant_new_string(backend_name(st->backend_override)));
 
-  GVariant *sprops = g_variant_ref_sink(g_variant_builder_end(&b));
+  GVariant *props = g_variant_ref_sink(g_variant_builder_end(&b));
 
-  g_autoptr(GVariant) ret_create_stream = call_sync(st->bus,
-                                                    IFACE_SC,
-                                                    st->session_path,
-                                                    IFACE_SESSION,
-                                                    "CreateStream",
-                                                    g_variant_new("(@a{sv})", sprops));
-  g_variant_unref(sprops);
+  g_autoptr(GVariant) ret = call_sync(st->bus,
+                                      IFACE_SC,
+                                      st->session_path,
+                                      IFACE_SESSION,
+                                      "CreateStream",
+                                      g_variant_new("(@a{sv})", props));
+  g_variant_unref(props);
 
-  if (!ret_create_stream)
-    return;
+  if (!ret)
+    return FALSE;
 
   const char *stream_path_tmp = NULL;
 
-  g_variant_get(ret_create_stream, "(&o)", &stream_path_tmp);
+  g_variant_get(ret, "(&o)", &stream_path_tmp);
   st->stream_path = g_strdup(stream_path_tmp);
 
   g_print("[DBus] CreateStream -> %s\n", st->stream_path);
 
-  g_autoptr(GVariant) ret_start = call_sync(st->bus,
-                                            IFACE_SC,
-                                            st->session_path,
-                                            IFACE_SESSION,
-                                            "Start",
-                                            NULL);
-  if (!ret_start)
-    return;
+  return TRUE;
+}
+
+static gboolean
+start_session(StreamState *st)
+{
+  g_autoptr(GVariant) ret = call_sync(st->bus,
+                                      IFACE_SC,
+                                      st->session_path,
+                                      IFACE_SESSION,
+                                      "Start",
+                                      NULL);
+  if (!ret)
+    return FALSE;
 
   g_print("[DBus] Start ok (session=%s)\n", st->session_path);
 
+  return TRUE;
+}
+
+static void
+detect_backend(StreamState *st)
+{
   g_autoptr(GVariant) info = NULL;
 
   if (get_info_dbus(st->bus, st->stream_path, st, &info))
@@ -870,54 +904,34 @@ connect_and_prepare_stream(StreamState *st)
     st->backend = STREAM_BACKEND_MEMFD;
 
   if (st->backend_override != STREAM_BACKEND_UNKNOWN &&
-      st->backend != st->backend_override) {
-    const char *requested;
-    const char *actual;
-
-    if (st->backend_override == STREAM_BACKEND_MEMFD)
-      requested = "memfd";
-    else
-      requested = "native-buffer";
-
-    if (st->backend == STREAM_BACKEND_MEMFD)
-      actual = "memfd";
-    else if (st->backend == STREAM_BACKEND_NATIVE_BUFFER)
-      actual = "native-buffer";
-    else
-      actual = "unknown";
-
+      st->backend != st->backend_override)
     g_warning("[backend] requested %s but Mutter created %s",
-              requested,
-              actual);
+              backend_name(st->backend_override),
+              backend_name(st->backend));
+}
+
+static gboolean
+setup_backend(StreamState *st)
+{
+  if (st->backend == STREAM_BACKEND_NATIVE_BUFFER)
+    return setup_native_buffer_backend(st);
+
+  st->backend = STREAM_BACKEND_MEMFD;
+
+  if (!setup_memfd_backend(st))
+    return FALSE;
+
+  if (st->memfd.hdr) {
+    st->info_width = st->memfd.hdr->width;
+    st->info_height = st->memfd.hdr->height;
   }
 
-  if (st->backend == STREAM_BACKEND_NATIVE_BUFFER) {
-    if (!setup_native_buffer_backend(st)) {
-      stream_cleanup(st);
-      return;
-    }
-  } else {
-    st->backend = STREAM_BACKEND_MEMFD;
+  return TRUE;
+}
 
-    if (!setup_memfd_backend(st)) {
-      stream_cleanup(st);
-      return;
-    }
-
-    st->info_width = st->hdr ? st->hdr->width : st->info_width;
-    st->info_height = st->hdr ? st->hdr->height : st->info_height;
-  }
-
-  st->need_render_after_flip = FALSE;
-
-  st->vblank_valid = FALSE;
-  st->vblank_last_ns = 0;
-
-  if (st->vblank_lead_ns == 0)
-    st->vblank_lead_ns = 2000000;
-
-  pending_damage_set_full(st);
-
+static void
+setup_stream_signals(StreamState *st)
+{
   st->signal_sub_id = g_dbus_connection_signal_subscribe(st->bus,
                                                          IFACE_SC,
                                                          IFACE_STREAM,
@@ -943,15 +957,53 @@ connect_and_prepare_stream(StreamState *st)
   g_print("[DBus] subscribed FrameReady (id=%u) and FrameReadyWithDamage (id=%u)\n",
           st->signal_sub_id,
           st->signal_sub_damage_id);
+}
+
+static void
+setup_stream_pacing(StreamState *st)
+{
+  st->need_render_after_flip = FALSE;
+
+  st->vblank_valid = FALSE;
+  st->vblank_last_ns = 0;
+
+  if (st->vblank_lead_ns == 0)
+    st->vblank_lead_ns = 2000000;
+
+  pending_damage_set_full(st);
 
   st->render_pending_cb = cb_render_pending;
   st->vblank_cb = cb_vblank_rearm;
+}
+
+static void
+connect_and_prepare_stream(StreamState *st)
+{
+  if (!st || !st->bus)
+    return;
+
+  stream_cleanup(st);
+
+  if (!create_session(st))
+    return;
+
+  if (!create_stream(st))
+    return;
+
+  if (!start_session(st))
+    return;
+
+  detect_backend(st);
+
+  if (!setup_backend(st)) {
+    stream_cleanup(st);
+    return;
+  }
+
+  setup_stream_pacing(st);
+  setup_stream_signals(st);
 
   ensure_drm_ready(st);
-
-  if (st->request_timer_fd >= 0 &&
-      st->backend != STREAM_BACKEND_NATIVE_BUFFER)
-    stream_rearm_request_timer(st);
 
   render_or_defer(st);
   start_streaming(st);
@@ -1082,35 +1134,35 @@ stream_cleanup(StreamState *st)
     st->pending_damage = NULL;
   }
 
-  if (st->map_base && st->map_base != MAP_FAILED) {
-    munmap(st->map_base, st->map_len);
-    st->map_base = NULL;
-    st->map_len = 0;
+  if (st->memfd.map_base && st->memfd.map_base != MAP_FAILED) {
+    munmap(st->memfd.map_base, st->memfd.map_len);
+    st->memfd.map_base = NULL;
+    st->memfd.map_len = 0;
   }
 
-  if (st->memfd >= 0) {
-    close(st->memfd);
-    st->memfd = -1;
+  if (st->memfd.fd >= 0) {
+    close(st->memfd.fd);
+    st->memfd.fd = -1;
   }
 
-  st->hdr = NULL;
+  st->memfd.hdr = NULL;
 
   drm_native_buffer_cleanup(st);
 
-  if (st->native_info) {
-    g_variant_unref(st->native_info);
-    st->native_info = NULL;
+  if (st->native.info) {
+    g_variant_unref(st->native.info);
+    st->native.info = NULL;
   }
 
-  if (st->native_fds) {
-    for (int i = 0; i < st->native_n_fds; i++) {
-      if (st->native_fds[i] >= 0)
-        close(st->native_fds[i]);
+  if (st->native.fds) {
+    for (int i = 0; i < st->native.n_fds; i++) {
+      if (st->native.fds[i] >= 0)
+        close(st->native.fds[i]);
     }
 
-    g_free(st->native_fds);
-    st->native_fds = NULL;
-    st->native_n_fds = 0;
+    g_free(st->native.fds);
+    st->native.fds = NULL;
+    st->native.n_fds = 0;
   }
 
   st->backend = STREAM_BACKEND_UNKNOWN;
@@ -1133,10 +1185,10 @@ stream_cleanup(StreamState *st)
   st->render_pending_cb = NULL;
   st->vblank_cb = NULL;
 
-  if (st->cpu_buf) {
-    g_free(st->cpu_buf);
-    st->cpu_buf = NULL;
-    st->cpu_buf_len = 0;
+  if (st->memfd.cpu_buf) {
+    g_free(st->memfd.cpu_buf);
+    st->memfd.cpu_buf = NULL;
+    st->memfd.cpu_buf_len = 0;
   }
 
   g_clear_pointer(&st->session_path, g_free);

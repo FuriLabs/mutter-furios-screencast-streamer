@@ -43,7 +43,7 @@ main(int argc, char **argv)
 
   memset(&st, 0, sizeof(st));
 
-  st.memfd = -1;
+  st.memfd.fd = -1;
   st.sink.card_index = 1;
   st.sink.connector_want = NULL;
   st.sink.drm_fd = -1;

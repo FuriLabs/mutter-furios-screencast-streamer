@@ -21,10 +21,37 @@ typedef enum StreamBackendType
 
 typedef struct NativeSlotImport
 {
-  int prime_fd_index;
   uint32_t gem_handle;
   uint32_t fb_id;
 } NativeSlotImport;
+
+typedef struct MemfdBackendState
+{
+  int fd;
+  void *map_base;
+  size_t map_len;
+  MetaFuriosMemfdHeader *hdr;
+
+  guint8 *cpu_buf;
+  size_t cpu_buf_len;
+} MemfdBackendState;
+
+typedef struct NativeBufferBackendState
+{
+  GVariant *info;
+
+  int *fds;
+  int n_fds;
+
+  guint32 width;
+  guint32 height;
+  guint32 stride_pixels;
+  guint32 n_slots;
+
+  NativeSlotImport *slots;
+
+  gboolean modeset_done;
+} NativeBufferBackendState;
 
 struct StreamState;
 typedef struct StreamState StreamState;
@@ -59,23 +86,8 @@ struct StreamState
   guint32 info_height;
   double info_fps;
 
-  int memfd;
-  void *map_base;
-  size_t map_len;
-  MetaFuriosMemfdHeader *hdr;
-
-  GVariant *native_info;
-  int *native_fds;
-  int native_n_fds;
-
-  guint32 native_width;
-  guint32 native_height;
-  guint32 native_stride_pixels;
-  guint32 native_n_slots;
-
-  NativeSlotImport *native_slots;
-
-  gboolean native_modeset_done;
+  MemfdBackendState memfd;
+  NativeBufferBackendState native;
 
   guint signal_sub_id;
   guint signal_sub_damage_id;
@@ -103,9 +115,6 @@ struct StreamState
   guint32 pending_seq;
   guint32 pending_slot;
   GArray *pending_damage;
-
-  guint8 *cpu_buf;
-  size_t cpu_buf_len;
 
   gboolean vblank_valid;
   guint64 vblank_last_ns;

@@ -364,23 +364,23 @@ get_wanted_mode_size(StreamState *st,
 
   if (st) {
     if (st->backend == STREAM_BACKEND_NATIVE_BUFFER) {
-      if (st->native_width)
-        w = st->native_width;
+      if (st->native.width)
+        w = st->native.width;
       else if (st->info_width)
         w = st->info_width;
 
-      if (st->native_height)
-        h = st->native_height;
+      if (st->native.height)
+        h = st->native.height;
       else if (st->info_height)
         h = st->info_height;
     } else {
-      if (st->hdr && st->hdr->width)
-        w = st->hdr->width;
+      if (st->memfd.hdr && st->memfd.hdr->width)
+        w = st->memfd.hdr->width;
       else if (st->info_width)
         w = st->info_width;
 
-      if (st->hdr && st->hdr->height)
-        h = st->hdr->height;
+      if (st->memfd.hdr && st->memfd.hdr->height)
+        h = st->memfd.hdr->height;
       else if (st->info_height)
         h = st->info_height;
     }

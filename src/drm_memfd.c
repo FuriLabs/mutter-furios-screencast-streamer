@@ -31,10 +31,10 @@ get_slot_base(StreamState                 *st,
     slot = st->pending_slot % n_slots;
 
   size_t off = (size_t)header_bytes + (size_t)slot * (size_t)slot_bytes;
-  if (off + (size_t)slot_bytes > st->map_len)
+  if (off + (size_t)slot_bytes > st->memfd.map_len)
     return FALSE;
 
-  *out_slot_base = (const uint8_t *)st->map_base + off;
+  *out_slot_base = (const uint8_t *)st->memfd.map_base + off;
   return TRUE;
 }
 
@@ -64,7 +64,7 @@ copy_damage_direct_bxgx_to_back(StreamState                 *st,
   const uint32_t dst_stride = back->pitch;
 
   for (int tries = 0; tries < 6; tries++) {
-    uint32_t seq_a = __atomic_load_n(&st->hdr->seq, __ATOMIC_ACQUIRE);
+    uint32_t seq_a = __atomic_load_n(&st->memfd.hdr->seq, __ATOMIC_ACQUIRE);
 
     const uint8_t *slot_base = NULL;
     if (!get_slot_base(st, h, &slot_base))
@@ -109,7 +109,7 @@ copy_damage_direct_bxgx_to_back(StreamState                 *st,
       }
     }
 
-    uint32_t seq_b = __atomic_load_n(&st->hdr->seq, __ATOMIC_ACQUIRE);
+    uint32_t seq_b = __atomic_load_n(&st->memfd.hdr->seq, __ATOMIC_ACQUIRE);
     if (seq_a == seq_b)
       return TRUE;
   }
@@ -125,47 +125,47 @@ ensure_cpu_buf(StreamState *st,
     return;
   if (need == 0)
     return;
-  if (st->cpu_buf && st->cpu_buf_len == need)
+  if (st->memfd.cpu_buf && st->memfd.cpu_buf_len == need)
     return;
 
-  g_free(st->cpu_buf);
-  st->cpu_buf = g_malloc0(need);
-  st->cpu_buf_len = need;
+  g_free(st->memfd.cpu_buf);
+  st->memfd.cpu_buf = g_malloc0(need);
+  st->memfd.cpu_buf_len = need;
 }
 
 static gboolean
 snapshot_slot_to_cpu(StreamState *st)
 {
-  if (!st || !st->hdr || !st->map_base)
+  if (!st || !st->memfd.hdr || !st->memfd.map_base)
     return FALSE;
 
-  if (!memfd_header_sane(st->hdr))
+  if (!memfd_header_sane(st->memfd.hdr))
     return FALSE;
 
-  const uint32_t n_slots = st->hdr->n_slots ? st->hdr->n_slots : 1;
-  const uint32_t slot_bytes = st->hdr->slot_bytes;
-  const uint32_t header_bytes = st->hdr->header_bytes;
+  const uint32_t n_slots = st->memfd.hdr->n_slots ? st->memfd.hdr->n_slots : 1;
+  const uint32_t slot_bytes = st->memfd.hdr->slot_bytes;
+  const uint32_t header_bytes = st->memfd.hdr->header_bytes;
 
   if (slot_bytes == 0 || header_bytes < sizeof(MetaFuriosMemfdHeader))
     return FALSE;
 
   ensure_cpu_buf(st, (size_t)slot_bytes);
-  if (!st->cpu_buf)
+  if (!st->memfd.cpu_buf)
     return FALSE;
 
   for (int tries = 0; tries < 6; tries++) {
-    uint32_t seq_a = __atomic_load_n(&st->hdr->seq, __ATOMIC_ACQUIRE);
+    uint32_t seq_a = __atomic_load_n(&st->memfd.hdr->seq, __ATOMIC_ACQUIRE);
     uint32_t slot = st->pending_slot % n_slots;
 
     size_t off = (size_t)header_bytes + (size_t)slot * (size_t)slot_bytes;
-    if (off + (size_t)slot_bytes > st->map_len)
+    if (off + (size_t)slot_bytes > st->memfd.map_len)
       return FALSE;
 
-    const uint8_t *slot_base = (const uint8_t *)st->map_base + off;
+    const uint8_t *slot_base = (const uint8_t *)st->memfd.map_base + off;
 
-    memcpy(st->cpu_buf, slot_base, (size_t)slot_bytes);
+    memcpy(st->memfd.cpu_buf, slot_base, (size_t)slot_bytes);
 
-    uint32_t seq_b = __atomic_load_n(&st->hdr->seq, __ATOMIC_ACQUIRE);
+    uint32_t seq_b = __atomic_load_n(&st->memfd.hdr->seq, __ATOMIC_ACQUIRE);
     if (seq_a == seq_b)
       return TRUE;
   }
@@ -236,7 +236,7 @@ blit_damage_rgba_to_xrgb8888(DrmBuffer                   *dst,
 void
 render_frame_drm_memfd(StreamState *st)
 {
-  if (!st || !st->hdr)
+  if (!st || !st->memfd.hdr)
     return;
 
   ensure_drm_ready(st);
@@ -263,12 +263,12 @@ render_frame_drm_memfd(StreamState *st)
 
     r.x = 0;
     r.y = 0;
-    r.w = (int32_t)st->hdr->width;
-    r.h = (int32_t)st->hdr->height;
+    r.w = (int32_t)st->memfd.hdr->width;
+    r.h = (int32_t)st->memfd.hdr->height;
     g_array_append_val(st->pending_damage, r);
   }
 
-  MetaFuriosMemfdHeader tmp = *st->hdr;
+  MetaFuriosMemfdHeader tmp = *st->memfd.hdr;
 
   if (tmp.width > s->fb_w)
     tmp.width = s->fb_w;
@@ -298,7 +298,10 @@ render_frame_drm_memfd(StreamState *st)
     if (!full)
       memcpy(back->map, front->map, n);
 
-    blit_damage_rgba_to_xrgb8888(back, &tmp, st->cpu_buf, st->pending_damage);
+    blit_damage_rgba_to_xrgb8888(back,
+                                 &tmp,
+                                 st->memfd.cpu_buf,
+                                 st->pending_damage);
   }
 
   int ret = drmModePageFlip(s->drm_fd,
