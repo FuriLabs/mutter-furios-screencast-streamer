@@ -24,9 +24,6 @@ typedef struct NativeSlotImport
   int prime_fd_index;
   uint32_t gem_handle;
   uint32_t fb_id;
-  uint32_t used_fmt;
-  uint64_t used_mod;
-  uint32_t pitch;
 } NativeSlotImport;
 
 struct StreamState;
@@ -39,14 +36,6 @@ typedef struct StreamState StreamState;
  * @param st Stream state
  */
 typedef void (*StreamRenderPendingFunc)(StreamState *st);
-
-/**
- * Callback invoked from DRM page-flip handler after bookkeeping is complete.
- * Used to drive native-buffer pacing.
- *
- * @param st Stream state
- */
-typedef void (*StreamFlipCompleteFunc)(StreamState *st);
 
 /**
  * Callback invoked when vblank timestamp is updated, used to re-arm
@@ -87,8 +76,6 @@ struct StreamState
   NativeSlotImport *native_slots;
 
   gboolean native_modeset_done;
-  guint32 native_current_slot;
-  uint32_t native_current_fb_id;
 
   guint signal_sub_id;
   guint signal_sub_damage_id;
@@ -126,7 +113,6 @@ struct StreamState
   guint64 vblank_lead_ns;
 
   StreamRenderPendingFunc render_pending_cb;
-  StreamFlipCompleteFunc flip_complete_cb;
   StreamVblankFunc vblank_cb;
 
   DrmSink sink;

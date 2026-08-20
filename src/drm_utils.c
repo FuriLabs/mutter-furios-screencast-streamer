@@ -29,12 +29,6 @@ compute_vblank_period_ns_internal(const drmModeModeInfo *m)
   return period;
 }
 
-guint64
-drm_compute_vblank_period_ns(const drmModeModeInfo *m)
-{
-  return compute_vblank_period_ns_internal(m);
-}
-
 static const char *
 conn_type_str(uint32_t t)
 {
@@ -322,9 +316,6 @@ drm_page_flip_handler(int           fd,
     if (st->render_pending_cb)
       st->render_pending_cb(st);
   }
-
-  if (st->flip_complete_cb)
-    st->flip_complete_cb(st);
 }
 
 static gboolean

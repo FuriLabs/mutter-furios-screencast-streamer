@@ -345,8 +345,6 @@ setup_native_buffer_backend(StreamState *st)
   st->native_width = 0;
   st->native_height = 0;
   st->native_modeset_done = FALSE;
-  st->native_current_slot = 0;
-  st->native_current_fb_id = 0;
 
   st->last_seen_seq = 0;
   st->last_presented_seq = 0;
@@ -947,7 +945,6 @@ connect_and_prepare_stream(StreamState *st)
           st->signal_sub_damage_id);
 
   st->render_pending_cb = cb_render_pending;
-  st->flip_complete_cb = NULL;
   st->vblank_cb = cb_vblank_rearm;
 
   ensure_drm_ready(st);
@@ -1134,7 +1131,6 @@ stream_cleanup(StreamState *st)
   st->vblank_last_ns = 0;
 
   st->render_pending_cb = NULL;
-  st->flip_complete_cb = NULL;
   st->vblank_cb = NULL;
 
   if (st->cpu_buf) {

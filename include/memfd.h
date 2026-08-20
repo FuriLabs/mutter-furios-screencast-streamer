@@ -42,25 +42,6 @@ typedef struct __attribute__((packed)) MetaFuriosMemfdHeader
 } MetaFuriosMemfdHeader;
 
 /**
- * Convert MetaFuriosMemfdFormat value to a readable string.
- *
- * @param fmt Format value from MetaFuriosMemfdHeader::format
- * @return Static string describing the format
- */
-const char *
-memfd_format_name(uint32_t fmt);
-
-/**
- * Print the memfd header fields for debugging.
- *
- * @param tag Prefix tag printed before the header content
- * @param h Pointer to the header
- */
-void
-memfd_dump_header(const char                  *tag,
-                  const MetaFuriosMemfdHeader *h);
-
-/**
  * Validate basic header sanity.
  *
  * @param h Pointer to the header

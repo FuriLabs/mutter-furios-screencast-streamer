@@ -13,24 +13,7 @@ typedef enum
 {
   HAL_PIXEL_FORMAT_RGBA_8888 = 1,
   HAL_PIXEL_FORMAT_RGBX_8888 = 2,
-  HAL_PIXEL_FORMAT_RGB_888 = 3,
-  HAL_PIXEL_FORMAT_RGB_565 = 4,
   HAL_PIXEL_FORMAT_BGRA_8888 = 5,
-  HAL_PIXEL_FORMAT_YCBCR_422_SP = 16,
-  HAL_PIXEL_FORMAT_YCRCB_420_SP = 17,
-  HAL_PIXEL_FORMAT_YCBCR_422_I = 20,
-  HAL_PIXEL_FORMAT_RGBA_FP16 = 22,
-  HAL_PIXEL_FORMAT_RAW16 = 32,
-  HAL_PIXEL_FORMAT_BLOB = 33,
-  HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED = 34,
-  HAL_PIXEL_FORMAT_YCBCR_420_888 = 35,
-  HAL_PIXEL_FORMAT_RAW_OPAQUE = 36,
-  HAL_PIXEL_FORMAT_RAW10 = 37,
-  HAL_PIXEL_FORMAT_RAW12 = 38,
-  HAL_PIXEL_FORMAT_RGBA_1010102 = 43,
-  HAL_PIXEL_FORMAT_Y8 = 538982489,
-  HAL_PIXEL_FORMAT_Y16 = 540422489,
-  HAL_PIXEL_FORMAT_YV12 = 842094169,
 } android_pixel_format_t;
 
 static const uint32_t k_try_fmts_default[] = {
@@ -191,10 +174,6 @@ drm_native_buffer_cleanup(StreamState *st)
 
       imp->fb_id = 0;
       imp->gem_handle = 0;
-      imp->prime_fd_index = -1;
-      imp->used_fmt = 0;
-      imp->used_mod = 0;
-      imp->pitch = 0;
     }
 
     g_free(st->native_slots);
@@ -206,8 +185,6 @@ drm_native_buffer_cleanup(StreamState *st)
   st->native_width = 0;
   st->native_height = 0;
   st->native_modeset_done = FALSE;
-  st->native_current_slot = 0;
-  st->native_current_fb_id = 0;
 }
 
 static gboolean
@@ -241,18 +218,8 @@ native_init_from_info(StreamState *st)
   st->native_n_slots = n;
   st->native_stride_pixels = stride;
 
-  if (!st->native_slots) {
+  if (!st->native_slots)
     st->native_slots = g_new0(NativeSlotImport, st->native_n_slots);
-
-    for (guint i = 0; i < st->native_n_slots; i++) {
-      st->native_slots[i].prime_fd_index = -1;
-      st->native_slots[i].gem_handle = 0;
-      st->native_slots[i].fb_id = 0;
-      st->native_slots[i].used_fmt = 0;
-      st->native_slots[i].used_mod = 0;
-      st->native_slots[i].pitch = 0;
-    }
-  }
 
   return TRUE;
 }
@@ -296,7 +263,6 @@ native_import_slot_if_needed(StreamState *st,
   DrmSink *s = &st->sink;
   const int drm_fd = s->drm_fd;
 
-  int chosen_fd_index = -1;
   uint32_t gem_handle = 0;
 
   for (int i = 0; i < n_fd_indices; i++) {
@@ -311,7 +277,6 @@ native_import_slot_if_needed(StreamState *st,
 
     uint32_t hnd = 0;
     if (drmPrimeFDToHandle(drm_fd, fd, &hnd) == 0) {
-      chosen_fd_index = idx;
       gem_handle = hnd;
       break;
     }
@@ -319,7 +284,7 @@ native_import_slot_if_needed(StreamState *st,
 
   g_free(fd_indices);
 
-  if (chosen_fd_index < 0 || gem_handle == 0) {
+  if (gem_handle == 0) {
     g_warning("[native-buffer] slot %u: no dma-buf FD could be imported via drmPrimeFDToHandle", slot);
     return FALSE;
   }
@@ -334,8 +299,6 @@ native_import_slot_if_needed(StreamState *st,
 
   uint32_t fb_id = 0;
   gboolean fb_ok = FALSE;
-  uint32_t used_fmt = 0;
-  uint64_t used_mod = DRM_FORMAT_MOD_LINEAR;
 
   uint32_t handles[4] = { gem_handle, 0, 0, 0 };
   uint32_t pitches[4] = { pitch, 0, 0, 0 };
@@ -388,11 +351,8 @@ native_import_slot_if_needed(StreamState *st,
                                          modifiers,
                                          &fb_id,
                                          0);
-    if (ret == 0) {
+    if (ret == 0)
       fb_ok = TRUE;
-      used_fmt = try_fmts[fi];
-      used_mod = DRM_FORMAT_MOD_LINEAR;
-    }
   }
 
   if (!fb_ok) {
@@ -407,11 +367,8 @@ native_import_slot_if_needed(StreamState *st,
                               offsets,
                               &fb_id,
                               0);
-      if (ret == 0) {
+      if (ret == 0)
         fb_ok = TRUE;
-        used_fmt = try_fmts[fi];
-        used_mod = 0;
-      }
     }
   }
 
@@ -422,12 +379,8 @@ native_import_slot_if_needed(StreamState *st,
     return FALSE;
   }
 
-  imp->prime_fd_index = chosen_fd_index;
   imp->gem_handle = gem_handle;
   imp->fb_id = fb_id;
-  imp->used_fmt = used_fmt;
-  imp->used_mod = used_mod;
-  imp->pitch = pitch;
 
   return TRUE;
 }
@@ -467,8 +420,6 @@ native_modeset_if_needed(StreamState *st,
   }
 
   st->native_modeset_done = TRUE;
-  st->native_current_slot = slot;
-  st->native_current_fb_id = imp->fb_id;
 
   return TRUE;
 }
@@ -529,9 +480,6 @@ render_frame_drm_native_buffer(StreamState *st)
   s->pending_flip_next_front = s->front_idx;
 
   st->inflight_flip_seq = st->pending_seq;
-
-  st->native_current_slot = slot;
-  st->native_current_fb_id = imp->fb_id;
 
   st->force_full_damage = FALSE;
 

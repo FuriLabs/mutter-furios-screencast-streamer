@@ -69,15 +69,4 @@ drm_cleanup(DrmSink *s);
 void
 ensure_drm_ready(StreamState *st);
 
-/**
- * Compute the vblank period from mode timing.
- *
- * Falls back to approximately 60Hz when timing data is invalid.
- *
- * @param m DRM mode (may be NULL)
- * @return Estimated vblank period in nanoseconds
- */
-guint64
-drm_compute_vblank_period_ns(const drmModeModeInfo *m);
-
 #endif // DRM_UTILS_H
