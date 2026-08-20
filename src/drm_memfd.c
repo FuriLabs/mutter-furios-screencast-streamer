@@ -234,7 +234,7 @@ blit_damage_rgba_to_xrgb8888(DrmBuffer                   *dst,
 }
 
 void
-render_frame_drm_memfd(StreamState *st)
+drm_memfd_render_frame(StreamState *st)
 {
   if (!st || !st->memfd.hdr)
     return;

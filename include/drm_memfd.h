@@ -15,6 +15,6 @@ typedef struct StreamState StreamState;
  * @param st Stream state
  */
 void
-render_frame_drm_memfd(StreamState *st);
+drm_memfd_render_frame(StreamState *st);
 
 #endif // DRM_MEMFD_H

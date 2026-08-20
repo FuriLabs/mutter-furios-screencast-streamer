@@ -150,80 +150,6 @@ native_gem_close(int      drm_fd,
   drmIoctl(drm_fd, DRM_IOCTL_GEM_CLOSE, &close_arg);
 }
 
-void
-drm_native_buffer_cleanup(StreamState *st)
-{
-  if (!st)
-    return;
-
-  if (st->backend != STREAM_BACKEND_NATIVE_BUFFER)
-    return;
-
-  DrmSink *s = &st->sink;
-  const int drm_fd = s->drm_fd;
-
-  if (st->native.slots) {
-    for (guint i = 0; i < st->native.n_slots; i++) {
-      NativeSlotImport *imp = &st->native.slots[i];
-
-      if (drm_fd >= 0 && imp->fb_id)
-        drmModeRmFB(drm_fd, imp->fb_id);
-
-      if (drm_fd >= 0 && imp->gem_handle)
-        native_gem_close(drm_fd, imp->gem_handle);
-
-      imp->fb_id = 0;
-      imp->gem_handle = 0;
-    }
-
-    g_free(st->native.slots);
-    st->native.slots = NULL;
-  }
-
-  st->native.n_slots = 0;
-  st->native.stride_pixels = 0;
-  st->native.width = 0;
-  st->native.height = 0;
-  st->native.modeset_done = FALSE;
-}
-
-static gboolean
-native_init_from_info(StreamState *st)
-{
-  if (!st || !st->native.info)
-    return FALSE;
-
-  guint32 width = 0;
-  guint32 height = 0;
-  guint32 buffer_count = 0;
-  guint32 stride_pixels = 0;
-  g_autofree char *type = NULL;
-
-  if (!native_lookup_str(st->native.info, "type", &type))
-    return FALSE;
-
-  if (!type || strcmp(type, "native-buffer") != 0)
-    return FALSE;
-
-  native_lookup_u32(st->native.info, "width", &width);
-  native_lookup_u32(st->native.info, "height", &height);
-  native_lookup_u32(st->native.info, "buffer_count", &buffer_count);
-  native_lookup_u32(st->native.info, "stride_pixels", &stride_pixels);
-
-  if (buffer_count == 0)
-    buffer_count = 1;
-
-  st->native.width = width ? width : st->info_width;
-  st->native.height = height ? height : st->info_height;
-  st->native.n_slots = buffer_count;
-  st->native.stride_pixels = stride_pixels;
-
-  if (!st->native.slots)
-    st->native.slots = g_new0(NativeSlotImport, st->native.n_slots);
-
-  return TRUE;
-}
-
 static uint32_t
 native_import_gem_handle(StreamState *st,
                          int         *fd_indices,
@@ -337,21 +263,19 @@ native_create_fb(StreamState   *st,
 }
 
 static gboolean
-native_import_slot_if_needed(StreamState *st,
-                             guint32      slot)
+native_import_slot(StreamState *st,
+                   guint32      slot)
 {
   if (!st || !st->native.info || !st->native.fds || st->native.n_fds <= 0)
     return FALSE;
 
-  if (!native_init_from_info(st))
+  if (!st->native.slots || st->native.n_slots == 0)
     return FALSE;
 
   if (slot >= st->native.n_slots)
-    slot = slot % st->native.n_slots;
+    return FALSE;
 
   NativeSlotImport *imp = &st->native.slots[slot];
-  if (imp->fb_id != 0 && imp->gem_handle != 0)
-    return TRUE;
 
   g_autoptr(GVariant) buffers = NULL;
   if (!native_get_buffers_array(st->native.info, &buffers)) {
@@ -384,8 +308,6 @@ native_import_slot_if_needed(StreamState *st,
   }
 
   guint32 stride_pixels = st->native.stride_pixels;
-  if (stride_pixels == 0)
-    native_lookup_u32(st->native.info, "stride_pixels", &stride_pixels);
   if (stride_pixels == 0)
     stride_pixels = st->native.width ? st->native.width : 1920;
 
@@ -433,11 +355,11 @@ native_modeset_if_needed(StreamState *st,
   if (!s || s->drm_fd < 0 || !s->have_mode)
     return FALSE;
 
-  if (!native_import_slot_if_needed(st, slot))
+  if (!st->native.slots || st->native.n_slots == 0)
     return FALSE;
 
   if (slot >= st->native.n_slots)
-    slot = slot % st->native.n_slots;
+    return FALSE;
 
   NativeSlotImport *imp = &st->native.slots[slot];
   if (!imp->fb_id)
@@ -463,46 +385,130 @@ native_modeset_if_needed(StreamState *st,
   return TRUE;
 }
 
+gboolean
+drm_native_buffer_init(StreamState *st)
+{
+  if (!st || !st->native.info)
+    return FALSE;
+
+  if (st->native.slots)
+    return TRUE;
+
+  guint32 width = 0;
+  guint32 height = 0;
+  guint32 buffer_count = 0;
+  guint32 stride_pixels = 0;
+  g_autofree char *type = NULL;
+
+  if (!native_lookup_str(st->native.info, "type", &type))
+    return FALSE;
+
+  if (!type || strcmp(type, "native-buffer") != 0)
+    return FALSE;
+
+  native_lookup_u32(st->native.info, "width", &width);
+  native_lookup_u32(st->native.info, "height", &height);
+  native_lookup_u32(st->native.info, "buffer_count", &buffer_count);
+  native_lookup_u32(st->native.info, "stride_pixels", &stride_pixels);
+
+  if (buffer_count == 0)
+    buffer_count = 1;
+
+  st->native.width = width ? width : st->info_width;
+  st->native.height = height ? height : st->info_height;
+  st->native.n_slots = buffer_count;
+  st->native.stride_pixels = stride_pixels;
+
+  st->native.slots = g_new0(NativeSlotImport, st->native.n_slots);
+
+  return TRUE;
+}
+
+gboolean
+drm_native_buffer_import_all(StreamState *st)
+{
+  if (!st)
+    return FALSE;
+
+  if (st->sink.drm_fd < 0 || !st->sink.have_mode)
+    return FALSE;
+
+  if (!st->native.slots || st->native.n_slots == 0)
+    return FALSE;
+
+  for (guint32 slot = 0; slot < st->native.n_slots; slot++) {
+    if (!native_import_slot(st, slot)) {
+      g_warning("[native-buffer] failed to import slot %u", slot);
+      return FALSE;
+    }
+  }
+
+  return TRUE;
+}
+
 void
-render_frame_drm_native_buffer(StreamState *st)
+drm_native_buffer_cleanup(StreamState *st)
 {
   if (!st)
     return;
 
-  ensure_drm_ready(st);
+  if (st->backend != STREAM_BACKEND_NATIVE_BUFFER)
+    return;
 
   DrmSink *s = &st->sink;
-  if (s->drm_fd < 0)
-    return;
+  const int drm_fd = s->drm_fd;
 
-  if (!st->native.info) {
-    g_warning("[native-buffer] selected but native_info is NULL");
-    return;
+  if (st->native.slots) {
+    for (guint i = 0; i < st->native.n_slots; i++) {
+      NativeSlotImport *imp = &st->native.slots[i];
+
+      if (drm_fd >= 0 && imp->fb_id)
+        drmModeRmFB(drm_fd, imp->fb_id);
+
+      if (drm_fd >= 0 && imp->gem_handle)
+        native_gem_close(drm_fd, imp->gem_handle);
+
+      imp->fb_id = 0;
+      imp->gem_handle = 0;
+    }
+
+    g_free(st->native.slots);
+    st->native.slots = NULL;
   }
 
-  if (!native_init_from_info(st)) {
-    g_warning("[native-buffer] invalid native_info (missing type/fields)");
+  st->native.n_slots = 0;
+  st->native.stride_pixels = 0;
+  st->native.width = 0;
+  st->native.height = 0;
+  st->native.modeset_done = FALSE;
+}
+
+void
+drm_native_buffer_render_frame(StreamState *st)
+{
+  if (!st)
     return;
-  }
+
+  DrmSink *s = &st->sink;
 
   if (s->pending_flip) {
     st->need_render_after_flip = TRUE;
     return;
   }
 
-  guint32 slot = st->pending_slot;
-  if (st->native.n_slots > 0)
-    slot = slot % st->native.n_slots;
-
-  if (!native_modeset_if_needed(st, slot))
+  if (!st->native.slots || st->native.n_slots == 0)
     return;
 
-  if (!native_import_slot_if_needed(st, slot))
-    return;
+  guint32 slot = st->pending_slot % st->native.n_slots;
 
   NativeSlotImport *imp = &st->native.slots[slot];
   if (!imp->fb_id)
     return;
+
+  if (!st->native.modeset_done) {
+    if (!native_modeset_if_needed(st, slot))
+      return;
+  }
 
   errno = 0;
   int ret = drmModePageFlip(s->drm_fd,
@@ -516,7 +522,6 @@ render_frame_drm_native_buffer(StreamState *st)
   }
 
   s->pending_flip = 1;
-  s->pending_flip_next_front = s->front_idx;
 
   st->inflight_flip_seq = st->pending_seq;
 

@@ -291,7 +291,9 @@ drm_page_flip_handler(int           fd,
   DrmSink *s = &st->sink;
 
   s->pending_flip = 0;
-  s->front_idx = s->pending_flip_next_front;
+
+  if (st->backend == STREAM_BACKEND_MEMFD)
+    s->front_idx = s->pending_flip_next_front;
 
   if (st->inflight_flip_seq != 0)
     st->last_presented_seq = st->inflight_flip_seq;

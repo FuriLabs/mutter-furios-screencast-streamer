@@ -381,6 +381,11 @@ setup_native_buffer_backend(StreamState *st)
   st->pending_seq = 0;
   st->pending_slot = 0;
 
+  if (!drm_native_buffer_init(st)) {
+    g_warning("[native-buffer] failed to initialize native buffer metadata");
+    return FALSE;
+  }
+
   return TRUE;
 }
 
@@ -473,9 +478,9 @@ render_or_defer(StreamState *st)
   }
 
   if (st->backend == STREAM_BACKEND_NATIVE_BUFFER)
-    render_frame_drm_native_buffer(st);
+    drm_native_buffer_render_frame(st);
   else
-    render_frame_drm_memfd(st);
+    drm_memfd_render_frame(st);
 }
 
 static void
@@ -1000,10 +1005,17 @@ connect_and_prepare_stream(StreamState *st)
     return;
   }
 
+  ensure_drm_ready(st);
+
+  if (st->backend == STREAM_BACKEND_NATIVE_BUFFER) {
+    if (!drm_native_buffer_import_all(st)) {
+      stream_cleanup(st);
+      return;
+    }
+  }
+
   setup_stream_pacing(st);
   setup_stream_signals(st);
-
-  ensure_drm_ready(st);
 
   render_or_defer(st);
   start_streaming(st);
