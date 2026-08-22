@@ -50,6 +50,24 @@ typedef struct DrmSink
 
   uint32_t fb_w;
   uint32_t fb_h;
+
+  gboolean atomic_ready;
+  uint32_t plane_id;
+
+  uint32_t plane_fb_id_prop;
+  uint32_t plane_crtc_id_prop;
+
+  uint32_t plane_src_x_prop;
+  uint32_t plane_src_y_prop;
+  uint32_t plane_src_w_prop;
+  uint32_t plane_src_h_prop;
+
+  uint32_t plane_crtc_x_prop;
+  uint32_t plane_crtc_y_prop;
+  uint32_t plane_crtc_w_prop;
+  uint32_t plane_crtc_h_prop;
+
+  uint32_t plane_in_fence_fd_prop;
 } DrmSink;
 
 /**

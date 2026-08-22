@@ -9,6 +9,8 @@
 #include "utils.h"
 #include "dbus.h"
 
+#include <poll.h>
+
 typedef enum
 {
   HAL_PIXEL_FORMAT_RGBA_8888 = 1,
@@ -347,6 +349,156 @@ native_import_slot(StreamState *st,
 }
 
 static gboolean
+native_wait_fence(int fence_fd)
+{
+  if (fence_fd < 0)
+    return TRUE;
+
+  struct pollfd pfd;
+
+  memset(&pfd, 0, sizeof(pfd));
+  pfd.fd = fence_fd;
+  pfd.events = POLLIN;
+
+  for (;;) {
+    int ret = poll(&pfd, 1, -1);
+
+    if (ret > 0)
+      return TRUE;
+
+    if (ret < 0 && errno == EINTR)
+      continue;
+
+    if (ret < 0)
+      g_warning("[native-buffer] poll on fence fd failed: %s", g_strerror(errno));
+
+    return FALSE;
+  }
+}
+
+static gboolean
+native_atomic_add_property(drmModeAtomicReq *req,
+                           uint32_t          object_id,
+                           uint32_t          property_id,
+                           uint64_t          value)
+{
+  if (!req || !object_id || !property_id)
+    return FALSE;
+
+  return drmModeAtomicAddProperty(req,
+                                  object_id,
+                                  property_id,
+                                  value) >= 0;
+}
+
+static gboolean
+native_atomic_page_flip(StreamState *st,
+                        uint32_t     fb_id,
+                        int          fence_fd)
+{
+  if (!st || !fb_id)
+    return FALSE;
+
+  DrmSink *s = &st->sink;
+
+  if (!s->atomic_ready ||
+      !s->plane_id ||
+      fence_fd < 0)
+    return FALSE;
+
+  drmModeAtomicReq *req = drmModeAtomicAlloc();
+  if (!req)
+    return FALSE;
+
+  uint32_t src_w = st->native.width;
+  uint32_t src_h = st->native.height;
+
+  if (src_w == 0)
+    src_w = s->mode.hdisplay;
+  if (src_h == 0)
+    src_h = s->mode.vdisplay;
+
+  gboolean ok = TRUE;
+
+  ok &= native_atomic_add_property(req,
+                                   s->plane_id,
+                                   s->plane_fb_id_prop,
+                                   fb_id);
+
+  ok &= native_atomic_add_property(req,
+                                   s->plane_id,
+                                   s->plane_crtc_id_prop,
+                                   s->crtc_id);
+
+  ok &= native_atomic_add_property(req,
+                                   s->plane_id,
+                                   s->plane_src_x_prop,
+                                   0);
+
+  ok &= native_atomic_add_property(req,
+                                   s->plane_id,
+                                   s->plane_src_y_prop,
+                                   0);
+
+  ok &= native_atomic_add_property(req,
+                                   s->plane_id,
+                                   s->plane_src_w_prop,
+                                   (uint64_t)src_w << 16);
+
+  ok &= native_atomic_add_property(req,
+                                   s->plane_id,
+                                   s->plane_src_h_prop,
+                                   (uint64_t)src_h << 16);
+
+  ok &= native_atomic_add_property(req,
+                                   s->plane_id,
+                                   s->plane_crtc_x_prop,
+                                   0);
+
+  ok &= native_atomic_add_property(req,
+                                   s->plane_id,
+                                   s->plane_crtc_y_prop,
+                                   0);
+
+  ok &= native_atomic_add_property(req,
+                                   s->plane_id,
+                                   s->plane_crtc_w_prop,
+                                   s->mode.hdisplay);
+
+  ok &= native_atomic_add_property(req,
+                                   s->plane_id,
+                                   s->plane_crtc_h_prop,
+                                   s->mode.vdisplay);
+
+  ok &= native_atomic_add_property(req,
+                                   s->plane_id,
+                                   s->plane_in_fence_fd_prop,
+                                   (uint64_t)fence_fd);
+
+  if (!ok) {
+    drmModeAtomicFree(req);
+    return FALSE;
+  }
+
+  errno = 0;
+
+  int ret = drmModeAtomicCommit(s->drm_fd,
+                                req,
+                                DRM_MODE_ATOMIC_NONBLOCK |
+                                DRM_MODE_PAGE_FLIP_EVENT,
+                                st);
+
+  drmModeAtomicFree(req);
+
+  if (ret != 0) {
+    g_warning("[native-buffer] drmModeAtomicCommit failed: %s", g_strerror(errno));
+    return FALSE;
+  }
+
+  return TRUE;
+}
+
+static gboolean
 native_modeset_if_needed(StreamState *st,
                          guint32      slot)
 {
@@ -367,6 +519,14 @@ native_modeset_if_needed(StreamState *st,
 
   if (st->native.modeset_done)
     return TRUE;
+
+  if (st->native.use_fences && st->native.pending_fence_fd >= 0) {
+    if (!native_wait_fence(st->native.pending_fence_fd))
+      return FALSE;
+
+    close(st->native.pending_fence_fd);
+    st->native.pending_fence_fd = -1;
+  }
 
   int ret = drmModeSetCrtc(s->drm_fd,
                            s->crtc_id,
@@ -452,6 +612,11 @@ drm_native_buffer_cleanup(StreamState *st)
   if (!st)
     return;
 
+  if (st->native.pending_fence_fd >= 0) {
+    close(st->native.pending_fence_fd);
+    st->native.pending_fence_fd = -1;
+  }
+
   if (st->backend != STREAM_BACKEND_NATIVE_BUFFER)
     return;
 
@@ -510,15 +675,37 @@ drm_native_buffer_render_frame(StreamState *st)
       return;
   }
 
-  errno = 0;
-  int ret = drmModePageFlip(s->drm_fd,
-                            s->crtc_id,
-                            imp->fb_id,
-                            DRM_MODE_PAGE_FLIP_EVENT,
-                            st);
-  if (ret != 0) {
-    g_warning("[native-buffer] drmModePageFlip failed: %s", g_strerror(errno));
-    return;
+  if (st->native.use_fences &&
+      st->native.pending_fence_fd >= 0 &&
+      s->atomic_ready) {
+    if (!native_atomic_page_flip(st,
+                                 imp->fb_id,
+                                 st->native.pending_fence_fd))
+      return;
+
+    close(st->native.pending_fence_fd);
+    st->native.pending_fence_fd = -1;
+  } else {
+    if (st->native.use_fences &&
+        st->native.pending_fence_fd >= 0) {
+      if (!native_wait_fence(st->native.pending_fence_fd))
+        return;
+
+      close(st->native.pending_fence_fd);
+      st->native.pending_fence_fd = -1;
+    }
+
+    errno = 0;
+
+    int ret = drmModePageFlip(s->drm_fd,
+                              s->crtc_id,
+                              imp->fb_id,
+                              DRM_MODE_PAGE_FLIP_EVENT,
+                              st);
+    if (ret != 0) {
+      g_warning("[native-buffer] drmModePageFlip failed: %s", g_strerror(errno));
+      return;
+    }
   }
 
   s->pending_flip = 1;

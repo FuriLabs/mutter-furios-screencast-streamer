@@ -119,6 +119,21 @@ drm_cleanup(DrmSink *s)
 
   s->fb_w = 0;
   s->fb_h = 0;
+
+  s->atomic_ready = FALSE;
+  s->plane_id = 0;
+
+  s->plane_fb_id_prop = 0;
+  s->plane_crtc_id_prop = 0;
+  s->plane_src_x_prop = 0;
+  s->plane_src_y_prop = 0;
+  s->plane_src_w_prop = 0;
+  s->plane_src_h_prop = 0;
+  s->plane_crtc_x_prop = 0;
+  s->plane_crtc_y_prop = 0;
+  s->plane_crtc_w_prop = 0;
+  s->plane_crtc_h_prop = 0;
+  s->plane_in_fence_fd_prop = 0;
 }
 
 static int
@@ -392,6 +407,222 @@ get_wanted_mode_size(StreamState *st,
   *out_h = h;
 }
 
+static uint32_t
+drm_object_property_id(int         drm_fd,
+                       uint32_t    object_id,
+                       uint32_t    object_type,
+                       const char *name,
+                       uint64_t   *out_value)
+{
+  drmModeObjectProperties *properties = drmModeObjectGetProperties(drm_fd,
+                                                                   object_id,
+                                                                   object_type);
+  if (!properties)
+    return 0;
+
+  uint32_t property_id = 0;
+
+  for (uint32_t i = 0; i < properties->count_props; i++) {
+    drmModePropertyRes *property = drmModeGetProperty(drm_fd,
+                                                      properties->props[i]);
+    if (!property)
+      continue;
+
+    if (strcmp(property->name, name) == 0) {
+      property_id = property->prop_id;
+
+      if (out_value)
+        *out_value = properties->prop_values[i];
+
+      drmModeFreeProperty(property);
+      break;
+    }
+
+    drmModeFreeProperty(property);
+  }
+
+  drmModeFreeObjectProperties(properties);
+
+  return property_id;
+}
+
+static int
+drm_crtc_index(int      drm_fd,
+               uint32_t crtc_id)
+{
+  drmModeRes *resources = drmModeGetResources(drm_fd);
+  if (!resources)
+    return -1;
+
+  int index = -1;
+
+  for (int i = 0; i < resources->count_crtcs; i++) {
+    if (resources->crtcs[i] == crtc_id) {
+      index = i;
+      break;
+    }
+  }
+
+  drmModeFreeResources(resources);
+
+  return index;
+}
+
+static uint32_t
+drm_find_primary_plane(DrmSink *s)
+{
+  if (!s || s->drm_fd < 0 || !s->crtc_id)
+    return 0;
+
+  int crtc_index = drm_crtc_index(s->drm_fd, s->crtc_id);
+  if (crtc_index < 0)
+    return 0;
+
+  drmModePlaneRes *plane_resources = drmModeGetPlaneResources(s->drm_fd);
+  if (!plane_resources)
+    return 0;
+
+  uint32_t plane_id = 0;
+
+  for (uint32_t i = 0; i < plane_resources->count_planes; i++) {
+    drmModePlane *plane = drmModeGetPlane(s->drm_fd,
+                                          plane_resources->planes[i]);
+    if (!plane)
+      continue;
+
+    if (!(plane->possible_crtcs & (1u << crtc_index))) {
+      drmModeFreePlane(plane);
+      continue;
+    }
+
+    uint64_t type = 0;
+
+    uint32_t type_prop = drm_object_property_id(s->drm_fd,
+                                                plane->plane_id,
+                                                DRM_MODE_OBJECT_PLANE,
+                                                "type",
+                                                &type);
+
+    if (type_prop && type == DRM_PLANE_TYPE_PRIMARY) {
+      plane_id = plane->plane_id;
+      drmModeFreePlane(plane);
+      break;
+    }
+
+    drmModeFreePlane(plane);
+  }
+
+  drmModeFreePlaneResources(plane_resources);
+
+  return plane_id;
+}
+
+static gboolean
+drm_prepare_native_atomic(DrmSink *s)
+{
+  if (!s || s->drm_fd < 0 || !s->crtc_id)
+    return FALSE;
+
+  if (s->atomic_ready)
+    return TRUE;
+
+  s->plane_id = drm_find_primary_plane(s);
+  if (!s->plane_id) {
+    g_warning("[drm] could not find primary plane for crtc %u",
+              s->crtc_id);
+    return FALSE;
+  }
+
+  s->plane_fb_id_prop = drm_object_property_id(s->drm_fd,
+                                               s->plane_id,
+                                               DRM_MODE_OBJECT_PLANE,
+                                               "FB_ID",
+                                               NULL);
+
+  s->plane_crtc_id_prop = drm_object_property_id(s->drm_fd,
+                                                 s->plane_id,
+                                                 DRM_MODE_OBJECT_PLANE,
+                                                 "CRTC_ID",
+                                                 NULL);
+
+  s->plane_src_x_prop = drm_object_property_id(s->drm_fd,
+                                               s->plane_id,
+                                               DRM_MODE_OBJECT_PLANE,
+                                               "SRC_X",
+                                               NULL);
+
+  s->plane_src_y_prop = drm_object_property_id(s->drm_fd,
+                                               s->plane_id,
+                                               DRM_MODE_OBJECT_PLANE,
+                                               "SRC_Y",
+                                               NULL);
+
+  s->plane_src_w_prop = drm_object_property_id(s->drm_fd,
+                                               s->plane_id,
+                                               DRM_MODE_OBJECT_PLANE,
+                                               "SRC_W",
+                                               NULL);
+
+  s->plane_src_h_prop = drm_object_property_id(s->drm_fd,
+                                               s->plane_id,
+                                               DRM_MODE_OBJECT_PLANE,
+                                               "SRC_H",
+                                               NULL);
+
+  s->plane_crtc_x_prop = drm_object_property_id(s->drm_fd,
+                                                s->plane_id,
+                                                DRM_MODE_OBJECT_PLANE,
+                                                "CRTC_X",
+                                                NULL);
+
+  s->plane_crtc_y_prop = drm_object_property_id(s->drm_fd,
+                                                s->plane_id,
+                                                DRM_MODE_OBJECT_PLANE,
+                                                "CRTC_Y",
+                                                NULL);
+
+  s->plane_crtc_w_prop = drm_object_property_id(s->drm_fd,
+                                                s->plane_id,
+                                                DRM_MODE_OBJECT_PLANE,
+                                                "CRTC_W",
+                                                NULL);
+
+  s->plane_crtc_h_prop = drm_object_property_id(s->drm_fd,
+                                                s->plane_id,
+                                                DRM_MODE_OBJECT_PLANE,
+                                                "CRTC_H",
+                                                NULL);
+
+  s->plane_in_fence_fd_prop = drm_object_property_id(s->drm_fd,
+                                                     s->plane_id,
+                                                     DRM_MODE_OBJECT_PLANE,
+                                                     "IN_FENCE_FD",
+                                                     NULL);
+
+  if (!s->plane_fb_id_prop ||
+      !s->plane_crtc_id_prop ||
+      !s->plane_src_x_prop ||
+      !s->plane_src_y_prop ||
+      !s->plane_src_w_prop ||
+      !s->plane_src_h_prop ||
+      !s->plane_crtc_x_prop ||
+      !s->plane_crtc_y_prop ||
+      !s->plane_crtc_w_prop ||
+      !s->plane_crtc_h_prop ||
+      !s->plane_in_fence_fd_prop) {
+    g_warning("[drm] primary plane %u does not expose all required atomic properties", s->plane_id);
+    return FALSE;
+  }
+
+  s->atomic_ready = TRUE;
+
+  g_print("[drm] atomic native-buffer plane=%u IN_FENCE_FD=%u\n",
+          s->plane_id,
+          s->plane_in_fence_fd_prop);
+
+  return TRUE;
+}
+
 void
 ensure_drm_ready(StreamState *st)
 {
@@ -403,13 +634,16 @@ ensure_drm_ready(StreamState *st)
   /* native-buffer backend scans out imported dma-buf/native buffers */
   if (st->backend == STREAM_BACKEND_NATIVE_BUFFER) {
     if (s->drm_fd >= 0 && s->have_mode) {
+      if (st->native.use_fences && !s->atomic_ready)
+        drm_prepare_native_atomic(s);
+
       if (!s->drm_source_id)
         s->drm_source_id = g_unix_fd_add_full(G_PRIORITY_HIGH,
                                               s->drm_fd,
                                               (GIOCondition)(G_IO_IN |
                                                              G_IO_HUP |
                                                              G_IO_ERR |
-                                              G_IO_NVAL),
+                                                             G_IO_NVAL),
                                               drm_fd_ready_cb,
                                               st,
                                               NULL);
@@ -450,6 +684,19 @@ ensure_drm_ready(StreamState *st)
       g_warning("open %s failed: %s", path, g_strerror(errno));
       return;
     }
+
+    if (st->backend == STREAM_BACKEND_NATIVE_BUFFER &&
+        st->native.use_fences) {
+      if (drmSetClientCap(s->drm_fd,
+                          DRM_CLIENT_CAP_UNIVERSAL_PLANES,
+                          1) != 0)
+        g_warning("[drm] failed to enable universal planes: %s", g_strerror(errno));
+
+      if (drmSetClientCap(s->drm_fd,
+                          DRM_CLIENT_CAP_ATOMIC,
+                          1) != 0)
+        g_warning("[drm] failed to enable atomic modesetting: %s", g_strerror(errno));
+    }
   }
 
   if (!s->have_mode) {
@@ -474,6 +721,11 @@ ensure_drm_ready(StreamState *st)
 
     drm_cleanup(s);
     return;
+  }
+
+  if (st->backend == STREAM_BACKEND_NATIVE_BUFFER && st->native.use_fences) {
+    if (!drm_prepare_native_atomic(s))
+      g_warning("[drm] explicit fence support unavailable");
   }
 
   /*

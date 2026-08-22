@@ -159,6 +159,7 @@ backend_from_info(GVariant    *info,
   st->info_width = 0;
   st->info_height = 0;
   st->info_fps = 0.0;
+  st->native.use_fences = FALSE;
 
   g_autofree char *type_str = NULL;
 
@@ -184,13 +185,24 @@ backend_from_info(GVariant    *info,
         g_variant_unref(v_fps_u);
       }
     }
+
+    if (st->backend == STREAM_BACKEND_NATIVE_BUFFER) {
+      GVariant *v_fences = g_variant_lookup_value(info,
+                                                  "use-fences",
+                                                  G_VARIANT_TYPE_BOOLEAN);
+      if (v_fences) {
+        st->native.use_fences = g_variant_get_boolean(v_fences);
+        g_variant_unref(v_fences);
+      }
+    }
   }
 
-  g_print("[GetInfo] backend=%s width=%u height=%u fps=%f\n",
+  g_print("[GetInfo] backend=%s width=%u height=%u fps=%f fences=%s\n",
           backend_name(st->backend),
           st->info_width,
           st->info_height,
-          st->info_fps);
+          st->info_fps,
+          st->native.use_fences ? "yes" : "no");
 
   return st->backend;
 }
@@ -372,6 +384,7 @@ setup_native_buffer_backend(StreamState *st)
   st->native.width = 0;
   st->native.height = 0;
   st->native.modeset_done = FALSE;
+  st->native.pending_fence_fd = -1;
 
   st->last_seen_seq = 0;
   st->last_presented_seq = 0;
@@ -487,20 +500,35 @@ static void
 on_frame_ready_common(StreamState *st,
                       guint32      seq,
                       guint32      slot,
-                      GVariant    *damage_maybe)
+                      GVariant    *damage_maybe,
+                      int          fence_fd)
 {
-  if (!st)
+  if (!st) {
+    if (fence_fd >= 0)
+      close(fence_fd);
     return;
+  }
 
-  if (!sequence_after(seq, st->last_seen_seq))
+  if (!sequence_after(seq, st->last_seen_seq)) {
+    if (fence_fd >= 0)
+      close(fence_fd);
     return;
+  }
 
-    if (st->sink.pending_flip ||
-        sequence_skipped(seq, st->last_presented_seq))
-      st->force_full_damage = TRUE;
+  if (st->sink.pending_flip ||
+      sequence_skipped(seq, st->last_presented_seq))
+    st->force_full_damage = TRUE;
+
+  if (st->native.pending_fence_fd >= 0) {
+    close(st->native.pending_fence_fd);
+    st->native.pending_fence_fd = -1;
+  }
 
   st->pending_seq = seq;
   st->pending_slot = slot;
+
+  if (fence_fd >= 0)
+    st->native.pending_fence_fd = fence_fd;
 
   if (st->force_full_damage) {
     pending_damage_set_full(st);
@@ -540,7 +568,7 @@ on_frame_ready(GDBusConnection *connection,
           signal_name ? signal_name : "FrameReady",
           seq, slot);
 
-  on_frame_ready_common(st, seq, slot, NULL);
+  on_frame_ready_common(st, seq, slot, NULL, -1);
 }
 
 static void
@@ -568,10 +596,92 @@ on_frame_ready_with_damage(GDBusConnection *connection,
           signal_name ? signal_name : "FrameReadyWithDamage",
           seq, slot);
 
-  on_frame_ready_common(st, seq, slot, damage);
+  on_frame_ready_common(st, seq, slot, damage, -1);
 
   if (damage)
     g_variant_unref(damage);
+}
+
+static GDBusMessage *
+on_dbus_message(GDBusConnection *connection,
+                GDBusMessage    *message,
+                gboolean         incoming,
+                gpointer         user_data)
+{
+  (void)connection;
+
+  StreamState *st = user_data;
+
+  if (!st || !incoming)
+    return message;
+
+  if (g_dbus_message_get_message_type(message) != G_DBUS_MESSAGE_TYPE_SIGNAL)
+    return message;
+
+  const char *member = g_dbus_message_get_member(message);
+
+  if (!member ||
+      strcmp(member, "FrameReadyWithFence") != 0)
+    return message;
+
+  const char *interface_name = g_dbus_message_get_interface(message);
+
+  if (!interface_name ||
+      strcmp(interface_name, IFACE_STREAM) != 0)
+    return message;
+
+  const char *object_path = g_dbus_message_get_path(message);
+
+  if (!object_path ||
+      !st->stream_path ||
+      strcmp(object_path, st->stream_path) != 0)
+    return message;
+
+  GVariant *parameters = g_dbus_message_get_body(message);
+  if (!parameters ||
+      !g_variant_is_of_type(parameters, G_VARIANT_TYPE("(uuh)"))) {
+    g_warning("[signal] invalid FrameReadyWithFence body");
+    return message;
+  }
+
+  guint32 seq = 0;
+  guint32 slot = 0;
+  gint handle_index = -1;
+
+  g_variant_get(parameters,
+                "(uuh)",
+                &seq,
+                &slot,
+                &handle_index);
+
+  GUnixFDList *fd_list = g_dbus_message_get_unix_fd_list(message);
+  if (!fd_list || handle_index < 0) {
+    g_warning("[signal] FrameReadyWithFence has no valid fd list");
+    return message;
+  }
+
+  g_autoptr(GError) error = NULL;
+
+  int fence_fd = g_unix_fd_list_get(fd_list,
+                                    handle_index,
+                                    &error);
+  if (fence_fd < 0) {
+    g_warning("[signal] failed to get fence fd: %s", error ? error->message : "unknown error");
+    return message;
+  }
+
+  g_debug("[signal] FrameReadyWithFence(seq=%u slot=%u fd=%d)",
+          seq,
+          slot,
+          fence_fd);
+
+  on_frame_ready_common(st,
+                        seq,
+                        slot,
+                        NULL,
+                        fence_fd);
+
+  return message;
 }
 
 void
@@ -846,17 +956,25 @@ create_session(StreamState *st)
 }
 
 static gboolean
-create_stream(StreamState *st)
+create_stream(StreamState      *st,
+              StreamBackendType backend,
+              gboolean          use_fences)
 {
   GVariantBuilder b;
 
   g_variant_builder_init(&b, G_VARIANT_TYPE("a{sv}"));
 
-  if (st->backend_override != STREAM_BACKEND_UNKNOWN)
+  if (backend != STREAM_BACKEND_UNKNOWN)
     g_variant_builder_add(&b,
                           "{sv}",
                           "backend",
-                          g_variant_new_string(backend_name(st->backend_override)));
+                          g_variant_new_string(backend_name(backend)));
+
+  if (backend == STREAM_BACKEND_NATIVE_BUFFER)
+    g_variant_builder_add(&b,
+                          "{sv}",
+                          "use-fences",
+                          g_variant_new_boolean(use_fences));
 
   GVariant *props = g_variant_ref_sink(g_variant_builder_end(&b));
 
@@ -876,7 +994,10 @@ create_stream(StreamState *st)
   g_variant_get(ret, "(&o)", &stream_path_tmp);
   st->stream_path = g_strdup(stream_path_tmp);
 
-  g_print("[DBus] CreateStream -> %s\n", st->stream_path);
+  g_print("[DBus] CreateStream -> %s backend=%s fences=%s\n",
+          st->stream_path,
+          backend_name(backend),
+          use_fences ? "yes" : "no");
 
   return TRUE;
 }
@@ -899,20 +1020,46 @@ start_session(StreamState *st)
 }
 
 static void
+stop_session(StreamState *st)
+{
+  if (!st || !st->bus || !st->session_path)
+    return;
+
+  g_autoptr(GError) error = NULL;
+
+  GVariant *ret = g_dbus_connection_call_sync(st->bus,
+                                              IFACE_SC,
+                                              st->session_path,
+                                              IFACE_SESSION,
+                                              "Stop",
+                                              NULL,
+                                              NULL,
+                                              G_DBUS_CALL_FLAGS_NONE,
+                                              2000,
+                                              NULL,
+                                              &error);
+  if (!ret) {
+    g_debug("[DBus] session Stop failed: %s", error ? error->message : "unknown error");
+    return;
+  }
+
+  g_variant_unref(ret);
+}
+
+static gboolean
 detect_backend(StreamState *st)
 {
   g_autoptr(GVariant) info = NULL;
 
-  if (get_info_dbus(st->bus, st->stream_path, st, &info))
-    backend_from_info(info, st);
-  else
-    st->backend = STREAM_BACKEND_MEMFD;
+  if (!get_info_dbus(st->bus, st->stream_path, st, &info)) {
+    st->backend = STREAM_BACKEND_UNKNOWN;
+    st->native.use_fences = FALSE;
+    return FALSE;
+  }
 
-  if (st->backend_override != STREAM_BACKEND_UNKNOWN &&
-      st->backend != st->backend_override)
-    g_warning("[backend] requested %s but Mutter created %s",
-              backend_name(st->backend_override),
-              backend_name(st->backend));
+  backend_from_info(info, st);
+
+  return st->backend != STREAM_BACKEND_UNKNOWN;
 }
 
 static gboolean
@@ -937,6 +1084,18 @@ setup_backend(StreamState *st)
 static void
 setup_stream_signals(StreamState *st)
 {
+  if (st->backend == STREAM_BACKEND_NATIVE_BUFFER &&
+      st->native.use_fences) {
+    st->signal_filter_id = g_dbus_connection_add_filter(st->bus,
+                                                        on_dbus_message,
+                                                        st,
+                                                        NULL);
+
+    g_print("[DBus] watching FrameReadyWithFence (filter_id=%u)\n", st->signal_filter_id);
+
+    return;
+  }
+
   st->signal_sub_id = g_dbus_connection_signal_subscribe(st->bus,
                                                          IFACE_SC,
                                                          IFACE_STREAM,
@@ -982,35 +1141,95 @@ setup_stream_pacing(StreamState *st)
 }
 
 static void
-connect_and_prepare_stream(StreamState *st)
+reset_stream_attempt(StreamState *st)
 {
-  if (!st || !st->bus)
+  if (!st)
     return;
 
+  stop_session(st);
   stream_cleanup(st);
 
+  st->native.use_fences = FALSE;
+  st->native.pending_fence_fd = -1;
+}
+
+static gboolean
+prepare_stream_attempt(StreamState      *st,
+                       StreamBackendType requested_backend,
+                       gboolean          request_fences)
+{
+  if (!st || !st->bus)
+    return FALSE;
+
+  reset_stream_attempt(st);
+
   if (!create_session(st))
-    return;
+    return FALSE;
 
-  if (!create_stream(st))
-    return;
+  if (!create_stream(st,
+                     requested_backend,
+                     request_fences)) {
+    reset_stream_attempt(st);
+    return FALSE;
+  }
 
-  if (!start_session(st))
-    return;
+  if (!start_session(st)) {
+    reset_stream_attempt(st);
+    return FALSE;
+  }
 
-  detect_backend(st);
+  if (!detect_backend(st)) {
+    reset_stream_attempt(st);
+    return FALSE;
+  }
+
+  if (requested_backend == STREAM_BACKEND_NATIVE_BUFFER &&
+      st->backend != STREAM_BACKEND_NATIVE_BUFFER) {
+    g_debug("[backend] native-buffer request fell back to %s", backend_name(st->backend));
+
+    reset_stream_attempt(st);
+    return FALSE;
+  }
+
+  if (requested_backend == STREAM_BACKEND_NATIVE_BUFFER &&
+      request_fences &&
+      !st->native.use_fences) {
+    g_debug("[backend] native-buffer available but fences unavailable");
+
+    reset_stream_attempt(st);
+    return FALSE;
+  }
 
   if (!setup_backend(st)) {
-    stream_cleanup(st);
-    return;
+    reset_stream_attempt(st);
+    return FALSE;
   }
 
   ensure_drm_ready(st);
 
+  if (st->sink.drm_fd < 0 ||
+      !st->sink.have_mode) {
+    g_debug("[backend] DRM initialization failed");
+
+    reset_stream_attempt(st);
+    return FALSE;
+  }
+
+  if (requested_backend == STREAM_BACKEND_NATIVE_BUFFER &&
+      request_fences &&
+      !st->sink.atomic_ready) {
+    g_debug("[backend] DRM explicit fence support unavailable");
+
+    reset_stream_attempt(st);
+    return FALSE;
+  }
+
   if (st->backend == STREAM_BACKEND_NATIVE_BUFFER) {
     if (!drm_native_buffer_import_all(st)) {
-      stream_cleanup(st);
-      return;
+      g_debug("[backend] native-buffer DRM import failed");
+
+      reset_stream_attempt(st);
+      return FALSE;
     }
   }
 
@@ -1019,6 +1238,57 @@ connect_and_prepare_stream(StreamState *st)
 
   render_or_defer(st);
   start_streaming(st);
+
+  return TRUE;
+}
+
+static void
+connect_and_prepare_stream(StreamState *st)
+{
+  if (!st || !st->bus)
+    return;
+
+  reset_stream_attempt(st);
+
+  if (st->backend_override == STREAM_BACKEND_MEMFD) {
+    g_print("[backend] trying memfd\n");
+
+    if (!prepare_stream_attempt(st,
+                                STREAM_BACKEND_MEMFD,
+                                FALSE))
+      g_warning("[backend] failed to initialize memfd");
+
+    return;
+  }
+
+  g_print("[backend] trying native-buffer with fences\n");
+
+  if (prepare_stream_attempt(st,
+                             STREAM_BACKEND_NATIVE_BUFFER,
+                             TRUE)) {
+    g_print("[backend] using native-buffer with fences\n");
+    return;
+  }
+
+  g_print("[backend] native-buffer with fences unavailable, trying without fences\n");
+
+  if (prepare_stream_attempt(st,
+                             STREAM_BACKEND_NATIVE_BUFFER,
+                             FALSE)) {
+    g_print("[backend] using native-buffer without fences\n");
+    return;
+  }
+
+  g_print("[backend] native-buffer unavailable, trying memfd\n");
+
+  if (prepare_stream_attempt(st,
+                             STREAM_BACKEND_MEMFD,
+                             FALSE)) {
+    g_print("[backend] using memfd\n");
+    return;
+  }
+
+  g_warning("[backend] failed to initialize any stream backend");
 }
 
 static gboolean
@@ -1139,6 +1409,17 @@ stream_cleanup(StreamState *st)
     g_print("[DBus] unsub FrameReadyWithDamage (id=%u)\n", st->signal_sub_damage_id);
     g_dbus_connection_signal_unsubscribe(st->bus, st->signal_sub_damage_id);
     st->signal_sub_damage_id = 0;
+  }
+
+  if (st->signal_filter_id && st->bus) {
+    g_print("[DBus] remove FrameReadyWithFence filter (id=%u)\n", st->signal_filter_id);
+    g_dbus_connection_remove_filter(st->bus, st->signal_filter_id);
+    st->signal_filter_id = 0;
+  }
+
+  if (st->native.pending_fence_fd >= 0) {
+    close(st->native.pending_fence_fd);
+    st->native.pending_fence_fd = -1;
   }
 
   if (st->pending_damage) {

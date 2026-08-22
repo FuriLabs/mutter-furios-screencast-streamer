@@ -44,6 +44,9 @@ main(int argc, char **argv)
   memset(&st, 0, sizeof(st));
 
   st.memfd.fd = -1;
+  st.native.pending_fence_fd = -1;
+  st.native.use_fences = FALSE;
+
   st.sink.card_index = 1;
   st.sink.connector_want = NULL;
   st.sink.drm_fd = -1;

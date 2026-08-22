@@ -51,6 +51,9 @@ typedef struct NativeBufferBackendState
   NativeSlotImport *slots;
 
   gboolean modeset_done;
+
+  gboolean use_fences;
+  int pending_fence_fd;
 } NativeBufferBackendState;
 
 struct StreamState;
@@ -91,6 +94,7 @@ struct StreamState
 
   guint signal_sub_id;
   guint signal_sub_damage_id;
+  guint signal_filter_id;
 
   guint request_timer_id;
   int request_timer_fd;
