@@ -675,21 +675,30 @@ drm_native_buffer_render_frame(StreamState *st)
       return;
   }
 
+  s->pending_flip = 1;
+  st->inflight_flip_seq = st->pending_seq;
+
   if (st->native.use_fences &&
       st->native.pending_fence_fd >= 0 &&
       s->atomic_ready) {
     if (!native_atomic_page_flip(st,
                                  imp->fb_id,
-                                 st->native.pending_fence_fd))
+                                 st->native.pending_fence_fd)) {
+      s->pending_flip = 0;
+      st->inflight_flip_seq = 0;
       return;
+    }
 
     close(st->native.pending_fence_fd);
     st->native.pending_fence_fd = -1;
   } else {
     if (st->native.use_fences &&
         st->native.pending_fence_fd >= 0) {
-      if (!native_wait_fence(st->native.pending_fence_fd))
+      if (!native_wait_fence(st->native.pending_fence_fd)) {
+        s->pending_flip = 0;
+        st->inflight_flip_seq = 0;
         return;
+      }
 
       close(st->native.pending_fence_fd);
       st->native.pending_fence_fd = -1;
@@ -704,13 +713,13 @@ drm_native_buffer_render_frame(StreamState *st)
                               st);
     if (ret != 0) {
       g_warning("[native-buffer] drmModePageFlip failed: %s", g_strerror(errno));
+
+      s->pending_flip = 0;
+      st->inflight_flip_seq = 0;
+
       return;
     }
   }
-
-  s->pending_flip = 1;
-
-  st->inflight_flip_seq = st->pending_seq;
 
   st->force_full_damage = FALSE;
 

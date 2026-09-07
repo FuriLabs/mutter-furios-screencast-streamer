@@ -487,7 +487,18 @@ render_or_defer(StreamState *st)
 
   if (st->sink.pending_flip) {
     st->need_render_after_flip = TRUE;
-    return;
+
+    /*
+     * the pageflip may have completed between checking pending_flip
+     * and setting need_render_after_flip, so check again to avoid
+     * losing the deferred render.
+     *
+     * preferrably this should be signalled to us rather than checking twice
+     */
+    if (st->sink.pending_flip)
+      return;
+
+    st->need_render_after_flip = FALSE;
   }
 
   if (st->backend == STREAM_BACKEND_NATIVE_BUFFER)
